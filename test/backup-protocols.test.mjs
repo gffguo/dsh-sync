@@ -121,7 +121,17 @@ async function mkDavServer({ auth = null } = {}) {
   })
   await new Promise((fulfil) => server.listen(0, '127.0.0.1', fulfil))
   const url = 'http://127.0.0.1:' + server.address().port
-  return { server, tree, treeSet, log, url, close: () => new Promise((f) => server.close(f)) }
+  return {
+    server, tree, treeSet, log, url,
+    // undici 的全局连接池会 keep-alive 复用 TCP 连接，server.close() 要等连接
+    // 断开才回调——CI 上有 keep-alive 残留时最多挂 5s/台，极端情况永续。
+    // closeAllConnections 立刻掐掉所有连接，close() 立即返回。
+    close: () => new Promise((f) => {
+      server.closeIdleConnections?.()
+      server.closeAllConnections?.()
+      server.close(() => f())
+    }),
+  }
 }
 
 // ── WebDAV client wire tests ─────────────────────────────────────────────
