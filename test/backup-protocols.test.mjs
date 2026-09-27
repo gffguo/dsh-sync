@@ -502,24 +502,39 @@ test('status reflects protocol state; sync without any protocol is refused', asy
 
 test('POST protocol/test: local ok, webdav against fake server, unknown kind refused', async () => {
   const step = (m) => console.error('[t13] ' + m)
+  // CI 专用探针：调用 15s 未返回就打印进程内活动资源，暴露挂点
+  const call = async (label, h, body) => {
+    let timer = null
+    const probe = new Promise((r) => {
+      timer = setTimeout(() => r({ __timeout: true, res: process._getActiveResourcesInfo() }), 15000)
+      if (typeof timer.unref === 'function') timer.unref()
+    })
+    const out = await Promise.race([h.call('POST', '/dsh-sync/api/protocol/test', body), probe])
+    clearTimeout(timer)
+    if (out && out.__timeout) {
+      step(label + ' TIMEOUT; active resources: ' + JSON.stringify(out.res))
+      throw new Error(label + ' hung; active resources: ' + JSON.stringify(out.res))
+    }
+    return out
+  }
   step('mkDavServer')
   const srv = await mkDavServer({ auth: 'u:p' })
   try {
     const tmp = await mkdtemp()
     const h = makeHarness({})
     step('local probe')
-    const local = await h.call('POST', '/dsh-sync/api/protocol/test', { protocol: 'local', dir: tmp })
+    const local = await call('local probe', h, { protocol: 'local', dir: tmp })
     assert.equal(local.json.ok, true, 'local probe failed: ' + (local.json && local.json.error))
-    const localBad = await h.call('POST', '/dsh-sync/api/protocol/test', { protocol: 'local', dir: '/proc/x/y/z' })
+    const localBad = await call('local bad probe', h, { protocol: 'local', dir: '/proc/x/y/z' })
     assert.equal(localBad.json.ok, false)
     step('webdav ok probe')
-    const wd = await h.call('POST', '/dsh-sync/api/protocol/test', { protocol: 'webdav', url: srv.url, username: 'u', password: 'p', dir: 'sub' })
+    const wd = await call('webdav ok probe', h, { protocol: 'webdav', url: srv.url, username: 'u', password: 'p', dir: 'sub' })
     assert.equal(wd.json.ok, true, 'webdav probe failed: ' + (wd.json && wd.json.error))
     step('webdav bad probe')
-    const wdBad = await h.call('POST', '/dsh-sync/api/protocol/test', { protocol: 'webdav', url: srv.url, username: 'u', password: 'nope', dir: 'sub' })
+    const wdBad = await call('webdav bad probe', h, { protocol: 'webdav', url: srv.url, username: 'u', password: 'nope', dir: 'sub' })
     assert.equal(wdBad.json.ok, false)
     step('unknown kind')
-    const unknown = await h.call('POST', '/dsh-sync/api/protocol/test', { protocol: 'carrier-pigeon' })
+    const unknown = await call('unknown kind', h, { protocol: 'carrier-pigeon' })
     assert.equal(unknown.status, 400)
     step('done')
   } finally { await srv.close() }
