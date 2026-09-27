@@ -502,19 +502,11 @@ test('status reflects protocol state; sync without any protocol is refused', asy
 
 test('POST protocol/test: local ok, webdav against fake server, unknown kind refused', async () => {
   const step = (m) => console.error('[t13] ' + m)
-  // CI 专用探针：调用 15s 未返回就打印进程内活动资源，暴露挂点
+  // CI 专用探针：包一层 handler 与 fs 操作，进出都打日志，暴露挂点
   const call = async (label, h, body) => {
-    let timer = null
-    const probe = new Promise((r) => {
-      timer = setTimeout(() => r({ __timeout: true, res: process._getActiveResourcesInfo() }), 15000)
-      if (typeof timer.unref === 'function') timer.unref()
-    })
-    const out = await Promise.race([h.call('POST', '/dsh-sync/api/protocol/test', body), probe])
-    clearTimeout(timer)
-    if (out && out.__timeout) {
-      step(label + ' TIMEOUT; active resources: ' + JSON.stringify(out.res))
-      throw new Error(label + ' hung; active resources: ' + JSON.stringify(out.res))
-    }
+    step(label + ' call enter')
+    const out = await h.call('POST', '/dsh-sync/api/protocol/test', body)
+    step(label + ' call exit')
     return out
   }
   step('mkDavServer')
@@ -522,6 +514,21 @@ test('POST protocol/test: local ok, webdav against fake server, unknown kind ref
   try {
     const tmp = await mkdtemp()
     const h = makeHarness({})
+    const origHandler = h.routes[0].handler
+    h.routes[0].handler = async (q, s) => {
+      console.error('[t13][handler] enter ' + q.url)
+      try { return await origHandler(q, s) } finally { console.error('[t13][handler] exit ' + q.url) }
+    }
+    const fsP = fsp
+    for (const op of ['mkdir', 'writeFile', 'rm', 'readFile']) {
+      const orig = fsP[op].bind(fsP)
+      fsP[op] = async (...a) => {
+        console.error('[t13][fs] ' + op + ' ' + String(a[0]).slice(0, 80))
+        const r = await orig(...a)
+        console.error('[t13][fs] ' + op + ' done')
+        return r
+      }
+    }
     step('local probe')
     const local = await call('local probe', h, { protocol: 'local', dir: tmp })
     assert.equal(local.json.ok, true, 'local probe failed: ' + (local.json && local.json.error))
@@ -537,5 +544,6 @@ test('POST protocol/test: local ok, webdav against fake server, unknown kind ref
     const unknown = await call('unknown kind', h, { protocol: 'carrier-pigeon' })
     assert.equal(unknown.status, 400)
     step('done')
+    for (const op of ['mkdir', 'writeFile', 'rm', 'readFile']) delete fsP[op]
   } finally { await srv.close() }
 })
