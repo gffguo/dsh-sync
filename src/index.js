@@ -140,13 +140,15 @@ function syncSettingsSchema(S) {
     token: S.string(),
   })
 }
-let Config = null
+// 降级值必须是 undefined 而非 null：宿主 settings 的 schema() 只排除 undefined，
+// "toJSON" in null 会抛 TypeError 逃出 describe()，拖垮整份设置文档（同 dsh-continue#4）
+let Config
 try {
   Config = Schema
     ? Schema.object({
       sync: syncSettingsSchema(Schema).volatile(),
     })
-    : null
+    : undefined
 } catch { /* schemastery <3.18.4 无 .volatile()：降级为无 Config（设置写回不可用），插件运行不受影响 */ }
 
 // legacy settings.yaml.imported 读取（dsh 0.1.7 迁移残留；只支持平铺 key: value）
@@ -1526,7 +1528,7 @@ function createAgentRunJob({ prompt, dir, jobs, logger, sessions, token, onFinis
 module.exports = {
   name: 'dsh-sync',
   inject: ['webServer', 'settings', 'connection'],
-  Config,
+  Config: Config ?? undefined,
   __internals: { syncSpec, defaultRoots, parseRepoUrl, authedUrl, mirrorLiveToShadow, resolveLivePath, copyTree, gitExec, acquireLock, checkRepoPrivate, gitcodeRequest, ensureShadowRepo, runPush, runPull, reconcileRemote, gitCurrentCommit, atomicWriteFile, DEFAULT_SYNC_SETTINGS, CONFLICT_PROMPT_ZH, ALIGN_PROMPT_ZH, REMOTE_ALIGN_PROMPT_ZH, substituteParams, strategyForPath, STRATEGY_VALUES, snapshotMirrorSpec, sanitizeSnapshotName, pruneLocalSnapshots, promoteSnapshotToCloud,
     // remote backup browser（导出供测试）
     BROWSE_REF, logicalSpec, parseRemotePath, categoryForLogical, pullSafety, parseLsTree, fetchBrowseRef, browseRemote, browseRemoteTree, expandToBlobs, planRemotePull, applyRemotePullPlan,
