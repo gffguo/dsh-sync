@@ -501,49 +501,23 @@ test('status reflects protocol state; sync without any protocol is refused', asy
 })
 
 test('POST protocol/test: local ok, webdav against fake server, unknown kind refused', async () => {
-  const step = (m) => console.error('[t13] ' + m)
-  // CI 专用探针：包一层 handler 与 fs 操作，进出都打日志，暴露挂点
-  const call = async (label, h, body) => {
-    step(label + ' call enter')
-    const out = await h.call('POST', '/dsh-sync/api/protocol/test', body)
-    step(label + ' call exit')
-    return out
-  }
-  step('mkDavServer')
   const srv = await mkDavServer({ auth: 'u:p' })
   try {
     const tmp = await mkdtemp()
     const h = makeHarness({})
-    const origHandler = h.routes[0].handler
-    h.routes[0].handler = async (q, s) => {
-      console.error('[t13][handler] enter ' + q.url)
-      try { return await origHandler(q, s) } finally { console.error('[t13][handler] exit ' + q.url) }
-    }
-    const fsP = fsp
-    for (const op of ['mkdir', 'writeFile', 'rm', 'readFile']) {
-      const orig = fsP[op].bind(fsP)
-      fsP[op] = async (...a) => {
-        console.error('[t13][fs] ' + op + ' ' + String(a[0]).slice(0, 80))
-        const r = await orig(...a)
-        console.error('[t13][fs] ' + op + ' done')
-        return r
-      }
-    }
-    step('local probe')
-    const local = await call('local probe', h, { protocol: 'local', dir: tmp })
+    const local = await h.call('POST', '/dsh-sync/api/protocol/test', { protocol: 'local', dir: tmp })
     assert.equal(local.json.ok, true, 'local probe failed: ' + (local.json && local.json.error))
-    const localBad = await call('local bad probe', h, { protocol: 'local', dir: '/proc/x/y/z' })
+    // 坏路径用「文件下面的目录」（ENOTDIR 秒失败）——/proc 这类虚拟文件系统上的
+    // 递归 mkdir 在 Linux 上会挂住不返回（真机实证：CI 卡死 120s 的根因）
+    const blocker = join(tmp, 'blocker')
+    await fsp.writeFile(blocker, 'x')
+    const localBad = await h.call('POST', '/dsh-sync/api/protocol/test', { protocol: 'local', dir: join(blocker, 'child') })
     assert.equal(localBad.json.ok, false)
-    step('webdav ok probe')
-    const wd = await call('webdav ok probe', h, { protocol: 'webdav', url: srv.url, username: 'u', password: 'p', dir: 'sub' })
+    const wd = await h.call('POST', '/dsh-sync/api/protocol/test', { protocol: 'webdav', url: srv.url, username: 'u', password: 'p', dir: 'sub' })
     assert.equal(wd.json.ok, true, 'webdav probe failed: ' + (wd.json && wd.json.error))
-    step('webdav bad probe')
-    const wdBad = await call('webdav bad probe', h, { protocol: 'webdav', url: srv.url, username: 'u', password: 'nope', dir: 'sub' })
+    const wdBad = await h.call('POST', '/dsh-sync/api/protocol/test', { protocol: 'webdav', url: srv.url, username: 'u', password: 'nope', dir: 'sub' })
     assert.equal(wdBad.json.ok, false)
-    step('unknown kind')
-    const unknown = await call('unknown kind', h, { protocol: 'carrier-pigeon' })
+    const unknown = await h.call('POST', '/dsh-sync/api/protocol/test', { protocol: 'carrier-pigeon' })
     assert.equal(unknown.status, 400)
-    step('done')
-    for (const op of ['mkdir', 'writeFile', 'rm', 'readFile']) delete fsP[op]
   } finally { await srv.close() }
 })
