@@ -1,7 +1,7 @@
 {
   "name": "@weibaohui/dsh-sync",
-  "version": "0.3.4",
-  "description": "dsh 插件 · 多机同步：让多台机器上的 dsh 通过一个私有 GitCode 仓库保持一致——技能、会话、设置、插件清单四类内容各有独立开关与策略（备份/并集/覆盖）；变更走分支 → PR → 合并，推送前自动回填远端新增防误删，支持 AI 智能对齐（语义合并双方改动）与一键解决冲突；本地快照滚动保留可一键恢复；强制私有仓库，pull 不覆盖本地改动。",
+  "version": "0.4.0",
+  "description": "dsh 插件 · 多机同步与多协议备份：Git（分支→PR→合并、冲突交 AI）+ WebDAV + 本地文件夹三种协议各一个页签一个开关；技能/会话/设置/插件清单独立开关与策略；纯备份协议与 git backup 布局一致（backup/<实例ID>/）；快照本地优先、多协议通用上云与恢复回退。",
   "license": "MIT",
   "keywords": [
     "dsh",
@@ -9,6 +9,8 @@
     "cordis",
     "plugin",
     "sync",
+    "backup",
+    "webdav",
     "git",
     "gitcode",
     "dsh-plugin"

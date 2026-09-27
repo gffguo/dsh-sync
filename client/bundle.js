@@ -114,17 +114,45 @@ window.__ModuleLoader__.load({
       snapshotTitle: '快照',
       snapshotNow: '立即快照',
       snapshotNamePlaceholder: '快照名（可选）',
-      snapshotCloud: '上传到云端 git',
+      snapshotCloud: '上传到云端',
       snapshotAutoLabel: '每天自动快照',
       snapshotSkillsLabel: '快照含技能',
       snapshotKeepLabel: '本地保留份数',
-      snapshotHint: '快照优先存本地：滚动保留、超窗真删除真释放；勾了云端的才会写进 git 永久存档；恢复前会自动把当前状态再拍一份。',
+      snapshotHint: '快照优先存本地：滚动保留、超窗真删除真释放；勾选「上传到云端」会写入所有已启用的云端协议（git / WebDAV / 本地文件夹），布局均为 backup/<实例ID>/snapshots/；恢复前会自动把当前状态再拍一份，云端没有的本机会按 git → WebDAV → 本地 依次找。',
       snapshotEmpty: '还没有快照',
       snapshotInCloud: '已上云',
       snapshotLocalOnly: '仅本地',
       snapshotRestore: '恢复',
       snapshotBusy: '快照处理中…',
       restoreDone: '已恢复（当前状态已先拍快照），同步已触发',
+      tabsGeneral: '通用',
+      tabsGit: 'Git 仓库',
+      tabsWebdav: 'WebDAV',
+      tabsLocal: '本地文件夹',
+      gitEnabledLabel: '启用 Git 同步（分支 → PR → 合并）',
+      webdavEnabledLabel: '启用 WebDAV 备份',
+      localEnabledLabel: '启用本地文件夹备份',
+      protocolOffHint: '开关默认关闭；开启后填写目标参数，每次同步把启用的类别镜像到 backup/<实例ID>/，本地永不被读回覆盖。',
+      webdavUrlLabel: 'WebDAV 地址',
+      webdavUrlPlaceholder: 'https://dav.example.com/dav/',
+      webdavUserLabel: '用户名（可选）',
+      webdavPasswordLabel: '密码（可选）',
+      webdavDirLabel: '远端子目录',
+      webdavDirHint: '备份写入 <地址>/<子目录>/backup/<实例ID>/；兼容坚果云 / Nextcloud / Alist 等 WebDAV 服务',
+      localDirLabel: '本地备份目录',
+      localDirPlaceholder: '~/backups/dsh（支持 ~）',
+      localDirHint: '备份写入 <目录>/backup/<实例ID>/；每次同步整目录镜像（删除会传播），原子替换不怕中断',
+      testConn: '测试连接',
+      testing: '测试中…',
+      testOk: '连接成功',
+      testFailed: '连接失败',
+      lastBackupLabel: '上次备份',
+      backupNone: '尚未备份',
+      backupUploaded: '上传 {up} · 删除 {del} · 未变 {same}',
+      backupCount: '已镜像 {n} 个文件',
+      backupError: '失败',
+      noProtocolEnabled: '未启用任何同步/备份协议：请在下方任一协议页签开启并配置',
+      clearWebdavPassword: '清除密码',
       conflictTitle: '解决同步冲突',
       conflictHint: '检测到未合并的同步 PR（两台机器改了同一文件）。点击下方按钮，AI 会读取本机令牌、分析两边改动、解决冲突并合并 PR。',
       conflictPending: '有未解决的冲突 PR',
@@ -213,17 +241,45 @@ window.__ModuleLoader__.load({
       snapshotTitle: 'Snapshots',
       snapshotNow: 'Snapshot now',
       snapshotNamePlaceholder: 'snapshot name (optional)',
-      snapshotCloud: 'Upload to cloud git',
+      snapshotCloud: 'Upload to cloud',
       snapshotAutoLabel: 'Daily auto snapshot',
       snapshotSkillsLabel: 'Include skills',
       snapshotKeepLabel: 'Local keep count',
-      snapshotHint: 'Snapshots are local-first: rolling window, over-window ones are truly deleted; only checked ones are written to git as permanent archive; the current state is snapshotted automatically before any restore.',
+      snapshotHint: 'Snapshots are local-first: rolling window, over-window ones are truly deleted; checking "upload" writes to every enabled cloud protocol (git / WebDAV / local folder) under backup/<instanceId>/snapshots/; the current state is snapshotted before any restore, and missing local snapshots are fetched via git → WebDAV → local.',
       snapshotEmpty: 'No snapshots yet',
       snapshotInCloud: 'in cloud',
       snapshotLocalOnly: 'local',
       snapshotRestore: 'Restore',
       snapshotBusy: 'Working…',
       restoreDone: 'Restored (current state snapshotted first); sync triggered',
+      tabsGeneral: 'General',
+      tabsGit: 'Git repo',
+      tabsWebdav: 'WebDAV',
+      tabsLocal: 'Local folder',
+      gitEnabledLabel: 'Enable Git sync (branch → PR → merge)',
+      webdavEnabledLabel: 'Enable WebDAV backup',
+      localEnabledLabel: 'Enable local folder backup',
+      protocolOffHint: 'Off by default; turn on and fill in the target — each sync mirrors enabled groups to backup/<instanceId>/, never reading back over live.',
+      webdavUrlLabel: 'WebDAV URL',
+      webdavUrlPlaceholder: 'https://dav.example.com/dav/',
+      webdavUserLabel: 'Username (optional)',
+      webdavPasswordLabel: 'Password (optional)',
+      webdavDirLabel: 'Remote subdir',
+      webdavDirHint: 'Backs up to <url>/<subdir>/backup/<instanceId>/; works with Jianguoyun / Nextcloud / Alist WebDAV',
+      localDirLabel: 'Local backup dir',
+      localDirPlaceholder: '~/backups/dsh (~ supported)',
+      localDirHint: 'Backs up to <dir>/backup/<instanceId>/; full mirror each sync (deletions propagate), atomic swap is crash-safe',
+      testConn: 'Test connection',
+      testing: 'Testing…',
+      testOk: 'Connection OK',
+      testFailed: 'Connection failed',
+      lastBackupLabel: 'Last backup',
+      backupNone: 'never',
+      backupUploaded: 'uploaded {up} · deleted {del} · unchanged {same}',
+      backupCount: 'mirrored {n} files',
+      backupError: 'failed',
+      noProtocolEnabled: 'No sync/backup protocol enabled — pick one in the tabs below',
+      clearWebdavPassword: 'Clear password',
       conflictTitle: 'Resolve sync conflict',
       conflictHint: 'An unmerged sync PR exists (two machines edited the same file). Click below: the AI reads the local token, analyzes both sides, resolves the conflict and merges the PR.',
       conflictPending: 'Unresolved conflict PR',
@@ -304,6 +360,10 @@ window.__ModuleLoader__.load({
     .sk-page{position:relative;display:flex;flex-direction:column;gap:14px;color:var(--dsw-alias-label-primary);font-family:var(--dsw-font-family);font-size:var(--dsw-font-sm-14,14px)}
     .sk-body{display:flex;flex-direction:column;gap:14px}
     .sk-toolbar{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
+    .sk-tabs{display:flex;gap:2px;border-bottom:1px solid var(--dsw-alias-border-l1);flex-wrap:wrap}
+    .sk-tab{padding:8px 14px;border:none;background:transparent;color:var(--dsw-alias-label-secondary);font-size:13px;font-family:var(--dsw-font-family);cursor:pointer;border-bottom:2px solid transparent;white-space:nowrap}
+    .sk-tab:hover{color:var(--dsw-alias-label-primary)}
+    .sk-tab.on{color:var(--dsw-alias-state-business-primary);border-bottom-color:var(--dsw-alias-state-business-primary);font-weight:600}
     .sk-spacer{flex:1}
     .sk-hint{color:var(--dsw-alias-label-secondary)}
     .sk-dir{color:var(--dsw-alias-label-tertiary);font-size:var(--dsw-font-xs-13,12px)}
@@ -664,6 +724,7 @@ window.__ModuleLoader__.load({
       const [alignOpen, setAlignOpen] = useState(false)
       const [alignInitial, setAlignInitial] = useState(null)
       const [toastText, setToastText] = useState(null)
+      const [tab, setTab] = useState('general')
       const [repoUrl, setRepoUrl] = useState('')
       const [branch, setBranch] = useState('')
       const [token, setToken] = useState('')
@@ -679,19 +740,40 @@ window.__ModuleLoader__.load({
       const [snapCloud, setSnapCloud] = useState(false)
       const [snapBusy, setSnapBusy] = useState(false)
       const [browseOpen, setBrowseOpen] = useState(false)
+      // 多协议：每协议一个开关一个页签；密码只在输入非空时提交（空串不覆盖已存值）
+      const [gitOn, setGitOn] = useState(true)
+      const [wdvOn, setWdvOn] = useState(false)
+      const [wdv, setWdv] = useState({ url: '', username: '', password: '', dir: 'dsh-sync' })
+      const [locOn, setLocOn] = useState(false)
+      const [locDir, setLocDir] = useState('')
+      const [testBusy, setTestBusy] = useState(null)
+      const [testOut, setTestOut] = useState({})
+      const loadedRef = useRef(false)
 
       const onToast = (text, ms = 3000) => { setToastText(text); setTimeout(() => setToastText(null), ms) }
+      // 首次加载用服务端值填充表单；之后的 15s 轮询只刷新 status，不回写输入框
+      //（避免把用户正在编辑的内容冲掉）
       const refresh = () => getJson(API + '/status').then(d => {
         setStatus(d)
-        setRepoUrl(d.repoUrl)
-        setBranch(d.branch)
-        setIntervalMinutes(d.intervalMinutes)
-        setAutoSync(d.autoSync)
-        setSyncOnStartup(d.syncOnStartup)
-        setConflictMode(d.conflictMode)
-        setG({ skills: d.syncSkills, sessions: d.syncSessions, settings: d.syncSettings, plugins: d.syncPlugins })
-        if (d.strategies) setGs(d.strategies)
-        if (d.snapshot) setSnapCfg(d.snapshot)
+        if (!loadedRef.current) {
+          loadedRef.current = true
+          setRepoUrl(d.repoUrl || '')
+          setBranch(d.branch || '')
+          setIntervalMinutes(d.intervalMinutes || 30)
+          setAutoSync(d.autoSync !== false)
+          setSyncOnStartup(!!d.syncOnStartup)
+          setConflictMode(d.conflictMode || 'ai')
+          setG({ skills: d.syncSkills !== false, sessions: !!d.syncSessions, settings: d.syncSettings !== false, plugins: d.syncPlugins !== false })
+          if (d.strategies) setGs(d.strategies)
+          if (d.snapshot) setSnapCfg(d.snapshot)
+          const pr = d.protocols || {}
+          setGitOn(pr.git ? pr.git.enabled !== false : true)
+          if (pr.webdav) {
+            setWdvOn(!!pr.webdav.enabled)
+            setWdv(prev => ({ ...prev, url: pr.webdav.url || '', username: pr.webdav.username || '', dir: pr.webdav.dir || 'dsh-sync' }))
+          }
+          if (pr.local) { setLocOn(!!pr.local.enabled); setLocDir(pr.local.dir || '') }
+        }
         getJson(API + '/snapshot/list').then(l => setSnapList(l)).catch(() => {})
       }).catch(() => {})
       useEffect(() => {
@@ -733,13 +815,44 @@ window.__ModuleLoader__.load({
       }
       const doSave = async () => {
         try {
-          const patch = { repoUrl, branch, intervalMinutes, autoSync, syncOnStartup, conflictMode, syncSkills: g.skills, syncSessions: g.sessions, syncSettings: g.settings, syncPlugins: g.plugins, skillsStrategy: gs.skills, sessionsStrategy: gs.sessions, settingsStrategy: gs.settings, pluginsStrategy: gs.plugins, snapshotAuto: snapCfg.auto, snapshotSkills: snapCfg.skills, snapshotLocalKeep: snapCfg.localKeep }
+          const patch = {
+            repoUrl, branch, intervalMinutes, autoSync, syncOnStartup, conflictMode,
+            syncSkills: g.skills, syncSessions: g.sessions, syncSettings: g.settings, syncPlugins: g.plugins,
+            skillsStrategy: gs.skills, sessionsStrategy: gs.sessions, settingsStrategy: gs.settings, pluginsStrategy: gs.plugins,
+            snapshotAuto: snapCfg.auto, snapshotSkills: snapCfg.skills, snapshotLocalKeep: snapCfg.localKeep,
+            gitEnabled: gitOn,
+            webdavEnabled: wdvOn, webdavUrl: wdv.url, webdavUsername: wdv.username, webdavDir: wdv.dir,
+            localEnabled: locOn, localDir: locDir,
+          }
           if (token !== '') patch.token = token
+          if (wdv.password !== '') patch.webdavPassword = wdv.password
           await putSettings(patch)
           setToken('')
+          setWdv(prev => ({ ...prev, password: '' }))
           onToast(t('saved'), 2200)
           refresh()
         } catch (e) { onToast(e.message || t('operationFailed'), 4000) }
+      }
+      const doClearWebdavPassword = async () => {
+        try {
+          await putSettings({ webdavPassword: null })
+          setWdv(prev => ({ ...prev, password: '' }))
+          onToast(t('saved'), 2200)
+          refresh()
+        } catch (e) { onToast(e.message || t('operationFailed'), 4000) }
+      }
+      // 协议连通性测试：body 带上当前输入（未保存也能测）
+      const doTest = async (kind) => {
+        setTestBusy(kind)
+        try {
+          const body = kind === 'webdav'
+            ? { protocol: 'webdav', url: wdv.url, username: wdv.username, password: wdv.password || undefined, dir: wdv.dir }
+            : { protocol: 'local', dir: locDir }
+          const r = await fetch(API + '/protocol/test', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) })
+          const d = await r.json().catch(() => ({}))
+          setTestOut(prev => ({ ...prev, [kind]: d }))
+        } catch (e) { setTestOut(prev => ({ ...prev, [kind]: { ok: false, error: e && e.message } })) }
+        finally { setTestBusy(null) }
       }
       const doSnapshot = async () => {
         setSnapBusy(true)
@@ -781,102 +894,177 @@ window.__ModuleLoader__.load({
           g[key] && h('select', { className: 'sk-input sk-select', value: gs[key] || 'backup',
             onChange: e => setGs(prev => ({ ...prev, [key]: e.target.value })) },
             STRATS.map(v => h('option', { key: v, value: v }, t('strategy' + cap(v))))))
+        const fieldRow = (label, input, hint) => h('div', { style: { display: 'flex', flexDirection: 'column', gap: 4 } },
+          h('span', { className: 'sk-dir' }, label), input,
+          hint ? h('span', { className: 'sk-dir' }, hint) : null)
+        const protocolToggle = (on, setOn, label) => h('label', { className: 'sk-toggle' + (on ? ' on' : ''), style: { alignSelf: 'flex-start' } },
+          h('input', { type: 'checkbox', checked: on, onChange: e => setOn(e.target.checked) }), label)
+        const testRow = (kind) => h('div', { style: { display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' } },
+          h(ButtonLite, { small: true, disabled: testBusy !== null, onClick: () => doTest(kind) }, testBusy === kind ? t('testing') : t('testConn')),
+          testOut[kind] && h(Tag, { tone: testOut[kind].ok ? undefined : 'danger' },
+            testOut[kind].ok ? t('testOk') : t('testFailed') + (testOut[kind].error ? ' · ' + testOut[kind].error : '')))
+        // 上次备份结果行（webdav=增量计数 / local=镜像计数 / 失败=错误摘要）
+        const backupLine = (kind) => {
+          const b = status && status.lastBackup
+          if (!b || !b[kind]) return t('backupNone')
+          const e = b[kind]
+          if (e.ok === false) return t('backupError') + ' · ' + (e.error || '')
+          if (typeof e.uploaded === 'number') return t('backupUploaded', { up: e.uploaded, del: e.deleted, same: e.unchanged })
+          if (typeof e.count === 'number') return t('backupCount', { n: e.count })
+          return 'OK'
+        }
+        const backupRow = (kind) => h('div', { style: { display: 'flex', justifyContent: 'space-between', gap: 12 } },
+          h('span', { className: 'sk-dir' }, t('lastBackupLabel')), h('span', { className: 'sk-hint', style: { textAlign: 'right', wordBreak: 'break-all' } }, backupLine(kind)))
+
+        // ── 通用 tab：实例状态 / 内容开关 / 快照 / 调度 ──
+        const generalEl = [
+          h('div', { className: 'sk-card' },
+            h('div', { className: 'sk-head' },
+              h('span', { className: 'sk-dir' }, t('instanceLabel')),
+              h('span', { className: 'sk-hint' }, status.instanceId || '-'),
+              h('span', { className: 'sk-spacer' }),
+              status.syncing && h(Tag, { tone: 'accent' }, t('syncing'))),
+            row(t('lastSyncLabel'), status.lastSyncAt ? formatTime(status.lastSyncAt) : t('repoMissing'))),
+          h('div', null,
+            h('div', { className: 'sk-dir', style: { margin: '4px 0' } }, t('groupHint')),
+            h('div', { className: 'sk-toggles' },
+              groupCard('skills', t('toggleSkills')), groupCard('sessions', t('toggleSessions')),
+              groupCard('settings', t('toggleSettings')), groupCard('plugins', t('togglePlugins'))),
+            h('div', { className: 'sk-dir' }, t('strategyHint'))),
+          h('div', { style: { display: 'flex', flexDirection: 'column', gap: 6 } },
+            h('label', { style: { display: 'flex', alignItems: 'center', gap: 8, color: 'var(--dsw-alias-label-secondary)', fontSize: 13 } },
+              h('input', { type: 'checkbox', checked: autoSync, onChange: e => setAutoSync(e.target.checked) }), t('autoSyncLabel')),
+            h('label', { style: { display: 'flex', alignItems: 'center', gap: 8, color: 'var(--dsw-alias-label-secondary)', fontSize: 13 } },
+              h('input', { type: 'checkbox', checked: syncOnStartup, onChange: e => setSyncOnStartup(e.target.checked) }), t('syncOnStartupLabel')),
+            h('label', { style: { display: 'flex', alignItems: 'center', gap: 8, color: 'var(--dsw-alias-label-secondary)', fontSize: 13 } },
+              t('intervalLabel'), h('input', { className: 'sk-input', type: 'number', min: 5, value: intervalMinutes, onChange: e => setIntervalMinutes(Math.max(1, Number(e.target.value) || 30)), style: { width: 80 } }))),
+          h('div', { className: 'sk-card' },
+            h('div', { className: 'sk-head' },
+              h('span', { className: 'sk-dir' }, t('snapshotTitle')),
+              h('span', { className: 'sk-spacer' }),
+              snapBusy && h(Tag, { tone: 'accent' }, t('snapshotBusy')),
+              h('input', { className: 'sk-input', value: snapName, onChange: e => setSnapName(e.target.value), placeholder: t('snapshotNamePlaceholder'), style: { width: 180 } }),
+              h('label', { style: { display: 'flex', alignItems: 'center', gap: 5, color: 'var(--dsw-alias-label-secondary)', fontSize: 12.5 } },
+                h('input', { type: 'checkbox', checked: snapCloud, onChange: e => setSnapCloud(e.target.checked) }), t('snapshotCloud')),
+              h(ButtonLite, { primary: true, small: true, disabled: snapBusy, onClick: doSnapshot }, t('snapshotNow'))),
+            h('div', { className: 'sk-hint' }, t('snapshotHint')),
+            h('div', { style: { display: 'flex', gap: 16, flexWrap: 'wrap', alignItems: 'center', color: 'var(--dsw-alias-label-secondary)', fontSize: 13 } },
+              h('label', { style: { display: 'flex', alignItems: 'center', gap: 6 } },
+                h('input', { type: 'checkbox', checked: snapCfg.auto, onChange: e => setSnapCfg(p => ({ ...p, auto: e.target.checked })) }), t('snapshotAutoLabel')),
+              h('label', { style: { display: 'flex', alignItems: 'center', gap: 6 } },
+                h('input', { type: 'checkbox', checked: snapCfg.skills, onChange: e => setSnapCfg(p => ({ ...p, skills: e.target.checked })) }), t('snapshotSkillsLabel')),
+              h('label', { style: { display: 'flex', alignItems: 'center', gap: 6 } },
+                t('snapshotKeepLabel'),
+                h('input', { className: 'sk-input', type: 'number', min: 1, value: snapCfg.localKeep, onChange: e => setSnapCfg(p => ({ ...p, localKeep: Math.max(1, Number(e.target.value) || 30) })), style: { width: 64 } }))),
+            snapList === null
+              ? null
+              : (snapList.local.length === 0
+                ? h('div', { className: 'sk-hint' }, t('snapshotEmpty'))
+                : h('div', { style: { display: 'flex', flexDirection: 'column', gap: 4 } },
+                    snapList.local.map(s => h('div', { key: s.name, style: { display: 'flex', alignItems: 'center', gap: 10, padding: '4px 8px', border: '1px solid var(--dsw-alias-border-l1)', borderRadius: 8 } },
+                      h('span', { style: { fontSize: 12.5 } }, s.name),
+                      h(Tag, { tone: s.inCloud ? 'accent' : undefined }, s.inCloud ? t('snapshotInCloud') : t('snapshotLocalOnly')),
+                      h('span', { className: 'sk-spacer' }),
+                      h(ButtonLite, { small: true, disabled: snapBusy, onClick: () => doRestore(s.name) }, t('snapshotRestore'))))))),
+        ]
+
+        // ── Git tab：开关 + 仓库/令牌 + 冲突处理 + AI 按钮 ──
+        const rec = status.lastResult && status.lastResult.reconcile
+        const recApplied = rec && Array.isArray(rec.applied) ? rec.applied.length : 0
+        const recBoth = rec && Array.isArray(rec.bothModified) ? rec.bothModified.length : 0
+        const gitEl = [
+          protocolToggle(gitOn, setGitOn, t('gitEnabledLabel')),
+          gitOn && h('div', { style: { display: 'flex', flexDirection: 'column', gap: 10 } },
+            status.gitAvailable === false && h('div', { className: 'sk-tag danger' }, t('gitMissing')),
+            row(t('dirLabel'), status.dir),
+            h('input', { className: 'sk-input', value: repoUrl, onChange: e => setRepoUrl(e.target.value), placeholder: t('repoUrlPlaceholder'), style: { width: '100%' } }),
+            h('input', { className: 'sk-input', value: branch, onChange: e => setBranch(e.target.value), placeholder: t('branchLabel'), style: { width: '100%' } }),
+            h('div', { style: { display: 'flex', gap: 6, alignItems: 'center' } },
+              h('input', { className: 'sk-input', type: 'password', value: token, onChange: e => setToken(e.target.value),
+                placeholder: status.hasToken ? `${t('tokenLabel')} · ${t('tokenConfigured')}` : t('tokenLabel'), style: { flex: 1 } }),
+              status.hasToken && h(ButtonLite, { onClick: doClearToken }, t('clearToken'))),
+            h('div', { className: 'sk-dir' }, t('tokenHint')),
+            rec && (recApplied || recBoth) ? h(Tag, { tone: recBoth ? 'danger' : 'accent' }, t('reconcileLine', { applied: recApplied, both: recBoth })) : null,
+            h('div', { className: 'sk-toolbar' },
+              h(ButtonLite, { disabled: !status.repoUrl || !status.hasToken, title: !status.repoUrl || !status.hasToken ? t('notConfigured') : undefined, onClick: () => setBrowseOpen(true) }, t('browseRemote')),
+              h(ButtonLite, {
+                disabled: alignBusy || status.syncing || !status.repoUrl || !status.hasToken,
+                title: !status.repoUrl || !status.hasToken ? t('notConfigured') : undefined,
+                onClick: doAlign,
+              }, alignBusy ? t('running') : t('alignBtn')))),
+          gitOn && status.pendingConflict && h('div', { className: 'sk-card', style: { borderColor: 'var(--dsw-alias-state-error-primary)' } },
+            h('div', { className: 'sk-head' },
+              h(Tag, { tone: 'danger' }, t('conflictPending')),
+              h('span', { className: 'sk-spacer' }),
+              h(ButtonLite, { primary: true, small: true, onClick: () => setConflictOpen(true) }, t('resolveBtn'))),
+            h('div', { className: 'sk-hint' }, t('conflictHint'))),
+          gitOn && h('div', null,
+            h('div', { className: 'sk-dir', style: { margin: '4px 0' } }, t('conflictModeLabel')),
+            h('div', { className: 'sk-toggles' },
+              h('label', { className: 'sk-toggle' + (conflictMode === 'ai' ? ' on' : '') },
+                h('input', { type: 'radio', checked: conflictMode === 'ai', onChange: () => setConflictMode('ai') }), t('conflictModeAi')),
+              h('label', { className: 'sk-toggle' + (conflictMode === 'manual' ? ' on' : '') },
+                h('input', { type: 'radio', checked: conflictMode === 'manual', onChange: () => setConflictMode('manual') }), t('conflictModeManual'))),
+            h('div', { className: 'sk-dir', style: { marginTop: 4 } }, t('conflictModeHint'))),
+        ]
+
+        // ── WebDAV tab：开关 + 地址/账号 + 测试 + 上次备份 ──
+        const webdavEl = [
+          protocolToggle(wdvOn, setWdvOn, t('webdavEnabledLabel')),
+          wdvOn && h('div', { className: 'sk-hint' }, t('protocolOffHint')),
+          wdvOn && h('div', { className: 'sk-card' },
+            fieldRow(t('webdavUrlLabel'),
+              h('input', { className: 'sk-input', value: wdv.url, onChange: e => setWdv(p => ({ ...p, url: e.target.value })), placeholder: t('webdavUrlPlaceholder'), style: { width: '100%' } })),
+            h('div', { style: { display: 'flex', gap: 10, flexWrap: 'wrap' } },
+              fieldRow(t('webdavUserLabel'),
+                h('input', { className: 'sk-input', value: wdv.username, onChange: e => setWdv(p => ({ ...p, username: e.target.value })), style: { width: 200 } })),
+              fieldRow(t('webdavPasswordLabel'),
+                h('div', { style: { display: 'flex', gap: 6, alignItems: 'center' } },
+                  h('input', { className: 'sk-input', type: 'password', value: wdv.password, onChange: e => setWdv(p => ({ ...p, password: e.target.value })),
+                    placeholder: status.protocols && status.protocols.webdav && status.protocols.webdav.hasPassword ? `${t('webdavPasswordLabel')} · ${t('tokenConfigured')}` : t('webdavPasswordLabel'), style: { width: 200 } }),
+                  status.protocols && status.protocols.webdav && status.protocols.webdav.hasPassword && h(ButtonLite, { onClick: doClearWebdavPassword }, t('clearWebdavPassword'))))),
+            fieldRow(t('webdavDirLabel'),
+              h('input', { className: 'sk-input', value: wdv.dir, onChange: e => setWdv(p => ({ ...p, dir: e.target.value })), style: { width: 260 } }),
+              t('webdavDirHint')),
+            testRow('webdav'),
+            backupRow('webdav')),
+        ]
+
+        // ── 本地文件夹 tab：开关 + 目录 + 测试 + 上次备份 ──
+        const localEl = [
+          protocolToggle(locOn, setLocOn, t('localEnabledLabel')),
+          locOn && h('div', { className: 'sk-hint' }, t('protocolOffHint')),
+          locOn && h('div', { className: 'sk-card' },
+            fieldRow(t('localDirLabel'),
+              h('input', { className: 'sk-input', value: locDir, onChange: e => setLocDir(e.target.value), placeholder: t('localDirPlaceholder'), style: { width: '100%' } }),
+              t('localDirHint')),
+            testRow('local'),
+            backupRow('local')),
+        ]
+
+        // 底部工具栏（所有页签可见）：保存 + 立即同步；未启用任何协议时给提示
+        const pr = status.protocols || {}
+        const anyActive = !!((pr.git && pr.git.enabled !== false && status.repoUrl && status.hasToken)
+          || (pr.webdav && pr.webdav.enabled && pr.webdav.configured)
+          || (pr.local && pr.local.enabled && pr.local.configured))
+        const toolbar = h('div', { className: 'sk-toolbar' },
+          h(ButtonLite, { onClick: doSave }, t('save')),
+          h(ButtonLite, { primary: true, disabled: busy || status.syncing || !anyActive, title: !anyActive ? t('noProtocolEnabled') : undefined, onClick: doSync }, busy ? t('syncing') : t('syncNow')),
+          !anyActive && h('span', { className: 'sk-tag accent' }, t('noProtocolEnabled')))
+
+        const TABS = [['general', 'tabsGeneral'], ['git', 'tabsGit'], ['webdav', 'tabsWebdav'], ['local', 'tabsLocal']]
+        const wrap = (kids) => h('div', { style: { display: 'flex', flexDirection: 'column', gap: 14 } }, kids)
         body = status === null
           ? h('div', { style: { display: 'flex', alignItems: 'center', gap: 10, padding: 24, color: 'var(--dsw-alias-label-secondary)' } },
               h('div', { className: 'sk-spin' }), '…')
           : h('div', { className: 'sk-body' },
-              status.gitAvailable === false && h('div', { className: 'sk-tag danger' }, t('gitMissing')),
-              (!status.repoUrl || !status.hasToken) && h('div', { className: 'sk-tag accent' }, t('notConfigured')),
-              status.pendingConflict && h('div', { className: 'sk-card', style: { borderColor: 'var(--dsw-alias-state-error-primary)' } },
-                h('div', { className: 'sk-head' },
-                  h(Tag, { tone: 'danger' }, t('conflictPending')),
-                  h('span', { className: 'sk-spacer' }),
-                  h(ButtonLite, { primary: true, small: true, onClick: () => setConflictOpen(true) }, t('resolveBtn'))),
-                h('div', { className: 'sk-hint' }, t('conflictHint'))),
-              h('div', { className: 'sk-card' },
-                h('div', { className: 'sk-head' },
-                  h('span', { className: 'sk-dir' }, t('instanceLabel')),
-                  h('span', { className: 'sk-hint' }, status.instanceId || '-'),
-                  h('span', { className: 'sk-spacer' }),
-                  status.syncing && h(Tag, { tone: 'accent' }, t('syncing'))),
-                row(t('repoUrlLabel'), status.repoUrl || '-'),
-                row(t('branchLabel'), status.branch || '-'),
-                row(t('dirLabel'), status.dir),
-                row(t('lastSyncLabel'), status.lastSyncAt ? formatTime(status.lastSyncAt) : t('repoMissing'))),
-              (() => {
-                const rec = status.lastResult && status.lastResult.reconcile
-                const applied = rec && Array.isArray(rec.applied) ? rec.applied.length : 0
-                const both = rec && Array.isArray(rec.bothModified) ? rec.bothModified.length : 0
-                if (!rec || (!applied && !both)) return null
-                return h(Tag, { tone: both ? 'danger' : 'accent' }, t('reconcileLine', { applied, both }))
-              })(),
-              h('div', null,
-                h('div', { className: 'sk-dir', style: { margin: '4px 0' } }, t('groupHint')),
-                h('div', { className: 'sk-toggles' },
-                  groupCard('skills', t('toggleSkills')), groupCard('sessions', t('toggleSessions')),
-                  groupCard('settings', t('toggleSettings')), groupCard('plugins', t('togglePlugins'))),
-                h('div', { className: 'sk-dir' }, t('strategyHint'))),
-              h('div', { style: { display: 'flex', flexDirection: 'column', gap: 6 } },
-                h('label', { style: { display: 'flex', alignItems: 'center', gap: 8, color: 'var(--dsw-alias-label-secondary)', fontSize: 13 } },
-                  h('input', { type: 'checkbox', checked: autoSync, onChange: e => setAutoSync(e.target.checked) }), t('autoSyncLabel')),
-                h('label', { style: { display: 'flex', alignItems: 'center', gap: 8, color: 'var(--dsw-alias-label-secondary)', fontSize: 13 } },
-                  h('input', { type: 'checkbox', checked: syncOnStartup, onChange: e => setSyncOnStartup(e.target.checked) }), t('syncOnStartupLabel')),
-                h('label', { style: { display: 'flex', alignItems: 'center', gap: 8, color: 'var(--dsw-alias-label-secondary)', fontSize: 13 } },
-                  t('intervalLabel'), h('input', { className: 'sk-input', type: 'number', min: 5, value: intervalMinutes, onChange: e => setIntervalMinutes(Math.max(1, Number(e.target.value) || 30)), style: { width: 80 } }))),
-              h('div', { className: 'sk-card' },
-                h('div', { className: 'sk-head' },
-                  h('span', { className: 'sk-dir' }, t('snapshotTitle')),
-                  h('span', { className: 'sk-spacer' }),
-                  snapBusy && h(Tag, { tone: 'accent' }, t('snapshotBusy')),
-                  h('input', { className: 'sk-input', value: snapName, onChange: e => setSnapName(e.target.value), placeholder: t('snapshotNamePlaceholder'), style: { width: 180 } }),
-                  h('label', { style: { display: 'flex', alignItems: 'center', gap: 5, color: 'var(--dsw-alias-label-secondary)', fontSize: 12.5 } },
-                    h('input', { type: 'checkbox', checked: snapCloud, onChange: e => setSnapCloud(e.target.checked) }), t('snapshotCloud')),
-                  h(ButtonLite, { primary: true, small: true, disabled: snapBusy, onClick: doSnapshot }, t('snapshotNow'))),
-                h('div', { className: 'sk-hint' }, t('snapshotHint')),
-                h('div', { style: { display: 'flex', gap: 16, flexWrap: 'wrap', alignItems: 'center', color: 'var(--dsw-alias-label-secondary)', fontSize: 13 } },
-                  h('label', { style: { display: 'flex', alignItems: 'center', gap: 6 } },
-                    h('input', { type: 'checkbox', checked: snapCfg.auto, onChange: e => setSnapCfg(p => ({ ...p, auto: e.target.checked })) }), t('snapshotAutoLabel')),
-                  h('label', { style: { display: 'flex', alignItems: 'center', gap: 6 } },
-                    h('input', { type: 'checkbox', checked: snapCfg.skills, onChange: e => setSnapCfg(p => ({ ...p, skills: e.target.checked })) }), t('snapshotSkillsLabel')),
-                  h('label', { style: { display: 'flex', alignItems: 'center', gap: 6 } },
-                    t('snapshotKeepLabel'),
-                    h('input', { className: 'sk-input', type: 'number', min: 1, value: snapCfg.localKeep, onChange: e => setSnapCfg(p => ({ ...p, localKeep: Math.max(1, Number(e.target.value) || 30) })), style: { width: 64 } }))),
-                snapList === null
-                  ? null
-                  : (snapList.local.length === 0
-                    ? h('div', { className: 'sk-hint' }, t('snapshotEmpty'))
-                    : h('div', { style: { display: 'flex', flexDirection: 'column', gap: 4 } },
-                        snapList.local.map(s => h('div', { key: s.name, style: { display: 'flex', alignItems: 'center', gap: 10, padding: '4px 8px', border: '1px solid var(--dsw-alias-border-l1)', borderRadius: 8 } },
-                          h('span', { style: { fontSize: 12.5 } }, s.name),
-                          h(Tag, { tone: s.inCloud ? 'accent' : undefined }, s.inCloud ? t('snapshotInCloud') : t('snapshotLocalOnly')),
-                          h('span', { className: 'sk-spacer' }),
-                          h(ButtonLite, { small: true, disabled: snapBusy, onClick: () => doRestore(s.name) }, t('snapshotRestore'))))))),
-              h('div', { style: { display: 'flex', flexDirection: 'column', gap: 6 } },
-                h('input', { className: 'sk-input', value: repoUrl, onChange: e => setRepoUrl(e.target.value), placeholder: t('repoUrlPlaceholder'), style: { width: '100%' } }),
-                h('input', { className: 'sk-input', value: branch, onChange: e => setBranch(e.target.value), placeholder: t('branchLabel'), style: { width: '100%' } }),
-                h('div', { style: { display: 'flex', gap: 6, alignItems: 'center' } },
-                  h('input', { className: 'sk-input', type: 'password', value: token, onChange: e => setToken(e.target.value),
-                    placeholder: status && status.hasToken ? `${t('tokenLabel')} · ${t('tokenConfigured')}` : t('tokenLabel'), style: { flex: 1 } }),
-                  status && status.hasToken && h(ButtonLite, { onClick: doClearToken }, t('clearToken'))),
-                h('div', { className: 'sk-dir' }, t('tokenHint'))),
-              h('div', null,
-                h('div', { className: 'sk-dir', style: { margin: '4px 0' } }, t('conflictModeLabel')),
-                h('div', { className: 'sk-toggles' },
-                  h('label', { className: 'sk-toggle' + (conflictMode === 'ai' ? ' on' : '') },
-                    h('input', { type: 'radio', checked: conflictMode === 'ai', onChange: () => setConflictMode('ai') }), t('conflictModeAi')),
-                  h('label', { className: 'sk-toggle' + (conflictMode === 'manual' ? ' on' : '') },
-                    h('input', { type: 'radio', checked: conflictMode === 'manual', onChange: () => setConflictMode('manual') }), t('conflictModeManual'))),
-                h('div', { className: 'sk-dir', style: { marginTop: 4 } }, t('conflictModeHint'))),
-              h('div', { className: 'sk-toolbar' },
-                h(ButtonLite, { onClick: doSave }, t('save')),
-                h(ButtonLite, { disabled: !status.repoUrl || !status.hasToken, title: !status.repoUrl || !status.hasToken ? t('notConfigured') : undefined, onClick: () => setBrowseOpen(true) }, t('browseRemote')),
-                h('span', { className: 'sk-spacer' }),
-                h(ButtonLite, {
-                  disabled: alignBusy || status.syncing || !status.repoUrl || !status.hasToken,
-                  title: !status.repoUrl || !status.hasToken ? t('notConfigured') : undefined,
-                  onClick: doAlign,
-                }, alignBusy ? t('running') : t('alignBtn')),
-                h(ButtonLite, { primary: true, disabled: busy || status.syncing || alignBusy, onClick: doSync }, busy ? t('syncing') : t('syncNow'))))
+              h('div', { className: 'sk-tabs' },
+                TABS.map(([key, label]) => h('button', { key, className: 'sk-tab' + (tab === key ? ' on' : ''), onClick: () => setTab(key) }, t(label)))),
+              tab === 'general' && wrap(generalEl),
+              tab === 'git' && wrap(gitEl),
+              tab === 'webdav' && wrap(webdavEl),
+              tab === 'local' && wrap(localEl),
+              toolbar)
       } catch (renderErr) {
         ;(globalThis.__skErrors = globalThis.__skErrors || []).push('body: ' + (renderErr && renderErr.message))
         body = h('div', { className: 'sk-card', style: { color: 'var(--dsw-alias-state-error-primary)' } },

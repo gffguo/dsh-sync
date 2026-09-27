@@ -3,15 +3,20 @@
 /**
  * dsh-plugin-dsh-sync — Host half
  *
- * A small git-based sync system for multiple dsh replicas. Each instance
- * mirrors its skills / sessions / settings / plugins into a private GitCode
- * repository through a branch → PR → merge flow, so two replicas that both
- * touch the same file surface as a pull request instead of a silent
- * overwrite. Deterministic work (fetch / branch / commit / push) is done by
- * the git CLI directly; only the conflict step — which needs semantic
- * judgement — hands off to an in-process agent (same channel skills-management
- * share uses). Token is write-only through the host settings service and
- * never travels to the client in cleartext.
+ * A small sync/backup system for multiple dsh replicas. The git protocol
+ * mirrors selected live roots into a private GitCode repository through a
+ * branch → PR → merge flow, so two replicas that both touch the same file
+ * surface as a pull request instead of a silent overwrite. WebDAV and a
+ * local folder serve as additional pure-backup targets: each sync mirrors
+ * the enabled groups into backup/<instanceId>/… — byte-for-byte the same
+ * layout the git backup strategy uses — and never reads back over live.
+ * Snapshots are protocol-universal: taken locally first, promoted to every
+ * enabled target, restored by falling back through git → webdav → local.
+ * Deterministic work (fetch / branch / commit / push) is done by the git
+ * CLI directly; only the conflict step — which needs semantic judgement —
+ * hands off to an in-process agent (same channel skills-management share
+ * uses). Token is write-only through the host settings service and never
+ * travels to the client in cleartext.
  *
  * Architecture: a shadow working tree at $DSH_HOME/dsh-sync/repo mirrors
  * selected live roots. Push = fetch origin/main → reset shadow to origin/main
@@ -34,6 +39,8 @@ const { randomUUID } = require('node:crypto')
 const fsP = require('node:fs/promises')
 const { join, relative, resolve, sep } = require('node:path')
 const { homedir, hostname } = require('node:os')
+const { createWebdavClient } = require('./webdav.js')
+const { localMirrorSwap } = require('./backup.js')
 // settings 服务要求 schemastery schema（可调用 + toJSON；zod 不兼容，register 会抛错被吞）。
 // 宿主沙箱内解析打包依赖可能抛 ERR_INTERNAL_ASSERTION（.pnpm 软链），因此优先沿
 // dsh 全局安装取 settings 服务自用的那份副本，本地开发/测试再退回标准 require。
@@ -79,6 +86,17 @@ const DEFAULT_SYNC_SETTINGS = {
   snapshotSkills: false,      // 快照是否包含技能（体积大，默认只含 设置+插件清单）
   snapshotAuto: true,         // 每天首个同步自动打一份本地快照（auto-<日期>）
   snapshotLocalKeep: 30,      // 本地快照滚动保留份数（勾了云端的随时可从云端恢复）
+  // ── 多协议备份：git（完整同步）+ webdav / local（纯备份目标）各一个开关。
+  //    webdav/local 的内容与布局和 git 的 backup 策略一致：backup/<实例ID>/…
+  //    （快照落 backup/<实例ID>/snapshots/<名字>/），本地永不读回覆盖。 ──
+  gitEnabled: true,
+  webdavEnabled: false,
+  webdavUrl: '',
+  webdavUsername: '',
+  webdavPassword: '',         // 不回显；与 token 同语义（空串不覆盖、null 清除）
+  webdavDir: 'dsh-sync',      // 服务器上的子目录：备份写 <url>/<dir>/backup/<实例ID>/
+  localEnabled: false,
+  localDir: '',               // 本地备份目录（支持 ~）：写 <dir>/backup/<实例ID>/
 }
 
 const STRATEGY_VALUES = ['backup', 'union', 'remote', 'local']
@@ -111,6 +129,14 @@ function syncSettingsSchema(S) {
     snapshotSkills: S.boolean(),
     snapshotAuto: S.boolean(),
     snapshotLocalKeep: S.number(),
+    gitEnabled: S.boolean(),
+    webdavEnabled: S.boolean(),
+    webdavUrl: S.string(),
+    webdavUsername: S.string(),
+    webdavPassword: S.string(),
+    webdavDir: S.string(),
+    localEnabled: S.boolean(),
+    localDir: S.string(),
     token: S.string(),
   })
 }
@@ -333,6 +359,8 @@ function defaultRoots() {
     dshSkills: join(dh, 'skills'),
     agentsSkills: join(home, '.agents', 'skills'),
     agentsLock: join(home, '.agents', '.skill-lock.json'),
+    // 无点目录 ~/agents/skills：部分 agent 工具的技能根（目录不存在时静默跳过）
+    homeAgentsSkills: join(home, 'agents', 'skills'),
     sessions: join(dh, 'sessions'),
     settingsFile: join(dh, 'settings.yaml'),
     profiles: join(dh, 'profiles'),
@@ -352,6 +380,9 @@ function syncSpec(eff, roots = defaultRoots(), instanceId = 'instance') {
       { from: roots.dshSkills, to: skillsStrategy === 'backup' ? backup('skills/dsh') : 'skills/dsh' },
       // 软链解引用成实文件：跨机不能指望同一个 link target 存在
       { from: roots.agentsSkills, to: skillsStrategy === 'backup' ? backup('skills/agents') : 'skills/agents', followSymlinks: true },
+      // ~/agents/skills（无点）：云上用 agents-home 与 skills/agents 区分；
+      // skills/agents-home 与 skills/agents 无前缀包含关系，resolveLivePath 不会串
+      { from: roots.homeAgentsSkills, to: skillsStrategy === 'backup' ? backup('skills/agents-home') : 'skills/agents-home', followSymlinks: true },
       { from: roots.agentsLock, to: skillsStrategy === 'backup' ? backup('skills/.skill-lock.json') : 'skills/.skill-lock.json', file: true },
     ],
   })
@@ -440,6 +471,7 @@ function resolveLivePath(spec, shadowRel) {
   const norm = shadowRel.split(sep).join('/')
   for (const group of spec) {
     for (const src of group.sources) {
+      if (!src.from) continue   // 注入 roots 可缺省某根（测试/裁剪场景）
       const to = src.to.split(sep).join('/')
       if (src.file) {
         if (norm === to) return src.from
@@ -889,6 +921,117 @@ async function promoteSnapshotToCloud(binary, eff, { repoDir, instanceId, state,
   return { promoted: true, merged, prNumber, branch }
 }
 
+// ── Multi-protocol backup: webdav / local are pure backup targets ──────
+//    git 保留完整的 分支→PR→合并 同步语义；webdav/local 只做单向备份——
+//    每次同步把启用类别按 git backup 策略的同款布局（backup/<实例ID>/…）镜像
+//    上去，本地永不被读回覆盖；快照上云写 backup/<实例ID>/snapshots/<名字>/，
+//    与 promoteSnapshotToCloud 的 git 路径逐字一致。恢复时按 git → webdav →
+//    local 依次回退下载。
+
+/** git 协议是否处于可用配置（显式关掉或没填仓库/令牌都算关）。 */
+function gitProtocolOn(eff) {
+  return eff.gitEnabled !== false && !!eff.repoUrl && !!eff.token
+}
+
+/** 已启用的纯备份协议描述符（纯函数，测试可断言）。 */
+function resolveBackupProtocols(eff) {
+  const out = []
+  if (eff.webdavEnabled && eff.webdavUrl) {
+    out.push({ kind: 'webdav', url: eff.webdavUrl, username: eff.webdavUsername || '', password: eff.webdavPassword || '', basePath: eff.webdavDir || 'dsh-sync' })
+  }
+  if (eff.localEnabled && eff.localDir) {
+    out.push({ kind: 'local', dir: expandTilde(eff.localDir) })
+  }
+  return out
+}
+
+/** 备份镜像 spec：同 syncSpec，但所有组强制 backup 策略——产出的就是
+ *  backup/<实例ID>/… 布局（纯备份协议与 git 备份策略形式一致的落点）。 */
+function backupLayoutSpec(eff, roots, instanceId) {
+  return syncSpec({
+    ...eff,
+    skillsStrategy: 'backup',
+    sessionsStrategy: 'backup',
+    settingsStrategy: 'backup',
+    pluginsStrategy: 'backup',
+  }, roots, instanceId)
+}
+
+/** 把启用类别的 live 内容铸成 backup/<实例ID>/ 布局的 staging 目录，
+ *  webdav / local 两个协议共用同一份 staging。返回 staging 内实例根
+ *  （所有类别都关时是空目录——webdav 零请求成功，local 镜像出空备份）。 */
+async function stageBackupTree(eff, roots, instanceId, stagingDir) {
+  await fsP.rm(stagingDir, { recursive: true, force: true }).catch(() => {})
+  await mirrorLiveToShadow(backupLayoutSpec(eff, roots, instanceId), stagingDir)
+  const stagingRoot = join(stagingDir, 'backup', instanceId)
+  await fsP.mkdir(stagingRoot, { recursive: true })
+  return stagingRoot
+}
+
+/** 上传 staging 树到一个纯备份协议。
+ *  webdav 走 sha1 清单增量（manifest 只在整轮成功后由调用方落盘，失败自动
+ *  全量重试）；local 走 tmp-swap 原子镜像（含删除传播）。 */
+async function uploadBackupToOne(proto, stagingRoot, { instanceId, syncDir, force = false } = {}) {
+  if (proto.kind === 'local') {
+    return localMirrorSwap(stagingRoot, join(proto.dir, 'backup', instanceId))
+  }
+  if (proto.kind === 'webdav') {
+    const client = createWebdavClient(proto)
+    const manifestFile = join(syncDir, 'backup-manifest-webdav.json')
+    let manifest = {}
+    try { manifest = JSON.parse(await fsP.readFile(manifestFile, 'utf8')) } catch {}
+    const res = await client.syncTreeFromDir(stagingRoot, `backup/${instanceId}`, { manifest, force })
+    await atomicWriteFile(manifestFile, JSON.stringify(res.newManifest, null, 2))
+    return { ok: true, uploaded: res.uploaded.length, deleted: res.deleted.length, unchanged: res.unchanged }
+  }
+  throw new Error('unknown protocol: ' + proto.kind)
+}
+
+/** 铸 staging（backup/<实例ID>/ 布局）并依次上传到所有启用的纯备份协议。
+ *  单协议失败不影响其他协议，错误记在对应条目里。 */
+async function runBackupUpload(eff, { instanceId, syncDir, roots }, { force = false } = {}) {
+  const protos = resolveBackupProtocols(eff)
+  if (!protos.length) return null
+  const stagingRoot = await stageBackupTree(eff, roots || defaultRoots(), instanceId, join(syncDir, 'backup-staging'))
+  const out = {}
+  for (const proto of protos) {
+    try { out[proto.kind] = await uploadBackupToOne(proto, stagingRoot, { instanceId, syncDir, force }) }
+    catch (e) { out[proto.kind] = { ok: false, error: String(e && e.message) } }
+  }
+  return out
+}
+
+/** 把本地快照目录上传到一个纯备份协议（快照上云，与 git 的
+ *  backup/<实例ID>/snapshots/<名字>/ 逐字同布局）。 */
+async function promoteSnapshotToProtocol(proto, srcDir, { instanceId, snapName }) {
+  const rel = `backup/${instanceId}/snapshots/${snapName}`
+  if (proto.kind === 'local') {
+    await copyTree(srcDir, join(proto.dir, rel), {})
+    return { ok: true }
+  }
+  if (proto.kind === 'webdav') {
+    const uploaded = await createWebdavClient(proto).uploadDirTree(srcDir, rel)
+    return { ok: true, uploaded }
+  }
+  throw new Error('unknown protocol: ' + proto.kind)
+}
+
+/** 从纯备份协议下载快照到 destDir；没有则抛错（调用方继续回退）。 */
+async function fetchSnapshotFromProtocol(proto, { instanceId, snapName }, destDir) {
+  const rel = `backup/${instanceId}/snapshots/${snapName}`
+  if (proto.kind === 'local') {
+    const src = join(proto.dir, rel)
+    await fsP.access(src)
+    await copyTree(src, destDir, {})
+    return true
+  }
+  if (proto.kind === 'webdav') {
+    await createWebdavClient(proto).downloadTreeInto(rel, destDir)
+    return true
+  }
+  throw new Error('unknown protocol: ' + proto.kind)
+}
+
 // ── Remote backup browser: list instances + tree, selectively pull with
 //    safety guards. Browse is read-only against the git object DB — main is
 //    fetched into a dedicated ref (refs/dshsync/browse) so it never touches
@@ -1155,11 +1298,12 @@ const ALIGN_PROMPT_ZH = [
   '- 影子仓库（git 工作树，只读用于取版本）：{{shadowDir}}',
   '- 本机 live 同步根：',
   '  - 技能（dsh）：{{skillsDsh}}',
-  '  - 技能（agents）：{{skillsAgents}}',
+  '  - 技能（agents，~/.agents/skills）：{{skillsAgents}}',
+  '  - 技能（agents-home，~/agents/skills）：{{skillsHomeAgents}}',
   '  - 会话：{{sessions}}',
   '  - 设置文件：{{settingsFile}}',
   '  - 插件清单：{{profiles}}',
-  '- 影子路径 → live 路径映射：`skills/dsh/**` → 技能（dsh）根；`skills/agents/**` → 技能（agents）根；`skills/.skill-lock.json` → agents 根下 `.skill-lock.json`；`sessions/**` → 会话根；`settings/settings.yaml` → 设置文件；`plugins/**` → 插件清单根。',
+  '- 影子路径 → live 路径映射：`skills/dsh/**` → 技能（dsh）根；`skills/agents/**` → 技能（agents）根；`skills/agents-home/**` → 技能（agents-home）根；`skills/.skill-lock.json` → agents 根下 `.skill-lock.json`；`sessions/**` → 会话根；`settings/settings.yaml` → 设置文件；`plugins/**` → 插件清单根。',
   '- 备份目录：{{backupDir}}（改动前把 live 原文件按影子相对路径复制进去）',
   '- 本机 dsh web 地址：{{apiBase}}（用它触发同步，不需要令牌）',
   '- 访问令牌：{{token}}（仅兜底直接调 GitCode API 时用，严禁回显）',
@@ -1388,6 +1532,8 @@ module.exports = {
     BROWSE_REF, logicalSpec, parseRemotePath, categoryForLogical, pullSafety, parseLsTree, fetchBrowseRef, browseRemote, browseRemoteTree, expandToBlobs, planRemotePull, applyRemotePullPlan,
     // apiproxy（导出供测试：mock fetch 驱动 wire 形态回归）
     apiproxy, apiproxyCall, apiproxyLegacy, mintCookie,
+    // 多协议备份（导出供测试）
+    gitProtocolOn, resolveBackupProtocols, backupLayoutSpec, stageBackupTree, uploadBackupToOne, runBackupUpload, promoteSnapshotToProtocol, fetchSnapshotFromProtocol,
     __setConnection(svc) { connectionSvcRef = svc }, __resetApiproxyCache() { authedUrlCache = null; cookieCache = null },
     syncSettingsSchema, Config, parseLegacySettingsYaml, __seedLegacyYaml },
 
@@ -1524,56 +1670,61 @@ module.exports = {
     const ALIGN_COOLDOWN_MS = 30 * 60 * 1000
     const AUTO_ALIGN_MAX_FILES = 50
     const alignState = { active: false, lastSig: '', lastAt: 0 }
-    const runSync = async ({ autoAlign = true } = {}) => {
+    const runSync = async ({ autoAlign = true, forceBackup = false } = {}) => {
       if (syncRun !== null) return syncRun
       syncRun = (async () => {
         await stateLoaded
         const eff = syncSettings()
-        if (!eff.repoUrl || !eff.token) throw new Error('未配置仓库地址或访问令牌（到 ⚙ 同步设置 中填写）')
-        if (!(await gitAvailable(eff.gitBinary))) throw new Error('PATH 上找不到 git')
+        const gitOn = gitProtocolOn(eff)
+        const backupProtos = resolveBackupProtocols(eff)
+        if (!gitOn && backupProtos.length === 0) throw new Error('未启用任何同步/备份协议：请至少配置 Git 仓库、WebDAV 或本地文件夹之一（到 ⚙ 同步设置 对应页签填写）')
+        if (gitOn && !(await gitAvailable(eff.gitBinary))) throw new Error('PATH 上找不到 git')
         const release = await acquireLock(lockFile)
         if (release === null) throw new Error('另一个同步进程正在运行（已跳过）')
         const started = Date.now()
         let result = { pushed: false, pulled: false }
         try {
-          // 影子仓库先行（首次运行在这里 clone）：reconcile 需要它来 fetch/回填
-          await ensureShadowRepo(eff.gitBinary, eff, repoDir).catch(e => ctx.logger.warn(`dsh-sync: shadow init: ${e && e.message}`))
-          const ctx2 = { repoDir, instanceId: state.instanceId, state, logger: ctx.logger }
-          // reconcile first: pull remote-only/untouched changes into live so
-          // the full-snapshot push below never deletes another replica's adds
-          result.reconcile = await reconcileRemote(eff.gitBinary, eff, ctx2).catch(e => { result.reconcileError = String(e && e.message); return null })
-          const fresh = (result.reconcile && Array.isArray(result.reconcile.bothModified)) ? result.reconcile.bothModified : []
-          state.pendingBoth = state.pendingBoth && typeof state.pendingBoth === 'object' ? state.pendingBoth : {}
-          // 已挂账未解决的 bothModified 一并纳入（reconcile 只报本轮变更集里的文件，
-          // 但未解决文件的基线还在 pendingBoth 里，push 时同样要 preserve）
-          const pendings = Object.keys(state.pendingBoth)
-            .filter(p => !fresh.some(f => f.shadowPath === p))
-            .map(p => {
-              const livePath = resolveLivePath(syncSpec(eff, defaultRoots(), state.instanceId), p)
-              return livePath ? { shadowPath: p, livePath, baseCommit: state.pendingBoth[p] } : null
-            })
-            .filter(Boolean)
-          const both = [...fresh, ...pendings]
-          // 双方都改过的文件不随快照推送（preserve）：远端版本留在 main，本机版本留在
-          // live，等 AI 智能对齐做语义合并——不再静默覆盖
-          result.push = await runPush(eff.gitBinary, eff, { ...ctx2, preserve: both.map(f => f.shadowPath) }).catch(e => { result.pushError = String(e && e.message); return null })
-          result.pull = await runPull(eff.gitBinary, eff, ctx2).catch(e => { result.pullError = String(e && e.message); return null })
-          state.lastSyncAt = new Date().toISOString()
-          // conflictMode=ai：检测到双方改动 → 自动触发 AI 智能对齐（后台 job，
-          // 会话内可追问；agent 合并完 live 文件后自己会 curl /dsh-sync/api/sync 推送）
-          result.alignSkipped = autoAlign && eff.conflictMode === 'ai' && both.length > AUTO_ALIGN_MAX_FILES
-            ? { reason: `bothModified ${both.length} 个，超过自动对齐规模上限 ${AUTO_ALIGN_MAX_FILES}（多为双机首次收敛 churn，非人工冲突）；保留双方版本，可到设置页手动处理` }
-            : undefined
-          if (autoAlign && eff.conflictMode === 'ai' && both.length > 0 && both.length <= AUTO_ALIGN_MAX_FILES && !alignState.active) {
-            const sig = both.map(f => f.shadowPath).sort().join('|')
-            if (sig !== alignState.lastSig || Date.now() - alignState.lastAt > ALIGN_COOLDOWN_MS) {
-              alignState.lastSig = sig
-              alignState.lastAt = Date.now()
-              const startedJob = await startAlignJob(eff, both)
-              if (startedJob) result.align = { jobId: startedJob.id, bothModified: both.map(f => f.shadowPath) }
+          if (gitOn) {
+            // 影子仓库先行（首次运行在这里 clone）：reconcile 需要它来 fetch/回填
+            await ensureShadowRepo(eff.gitBinary, eff, repoDir).catch(e => ctx.logger.warn(`dsh-sync: shadow init: ${e && e.message}`))
+            const ctx2 = { repoDir, instanceId: state.instanceId, state, logger: ctx.logger }
+            // reconcile first: pull remote-only/untouched changes into live so
+            // the full-snapshot push below never deletes another replica's adds
+            result.reconcile = await reconcileRemote(eff.gitBinary, eff, ctx2).catch(e => { result.reconcileError = String(e && e.message); return null })
+            const fresh = (result.reconcile && Array.isArray(result.reconcile.bothModified)) ? result.reconcile.bothModified : []
+            state.pendingBoth = state.pendingBoth && typeof state.pendingBoth === 'object' ? state.pendingBoth : {}
+            // 已挂账未解决的 bothModified 一并纳入（reconcile 只报本轮变更集里的文件，
+            // 但未解决文件的基线还在 pendingBoth 里，push 时同样要 preserve）
+            const pendings = Object.keys(state.pendingBoth)
+              .filter(p => !fresh.some(f => f.shadowPath === p))
+              .map(p => {
+                const livePath = resolveLivePath(syncSpec(eff, defaultRoots(), state.instanceId), p)
+                return livePath ? { shadowPath: p, livePath, baseCommit: state.pendingBoth[p] } : null
+              })
+              .filter(Boolean)
+            const both = [...fresh, ...pendings]
+            // 双方都改过的文件不随快照推送（preserve）：远端版本留在 main，本机版本留在
+            // live，等 AI 智能对齐做语义合并——不再静默覆盖
+            result.push = await runPush(eff.gitBinary, eff, { ...ctx2, preserve: both.map(f => f.shadowPath) }).catch(e => { result.pushError = String(e && e.message); return null })
+            result.pull = await runPull(eff.gitBinary, eff, ctx2).catch(e => { result.pullError = String(e && e.message); return null })
+            // conflictMode=ai：检测到双方改动 → 自动触发 AI 智能对齐（后台 job，
+            // 会话内可追问；agent 合并完 live 文件后自己会 curl /dsh-sync/api/sync 推送）
+            result.alignSkipped = autoAlign && eff.conflictMode === 'ai' && both.length > AUTO_ALIGN_MAX_FILES
+              ? { reason: `bothModified ${both.length} 个，超过自动对齐规模上限 ${AUTO_ALIGN_MAX_FILES}（多为双机首次收敛 churn，非人工冲突）；保留双方版本，可到设置页手动处理` }
+              : undefined
+            if (autoAlign && eff.conflictMode === 'ai' && both.length > 0 && both.length <= AUTO_ALIGN_MAX_FILES && !alignState.active) {
+              const sig = both.map(f => f.shadowPath).sort().join('|')
+              if (sig !== alignState.lastSig || Date.now() - alignState.lastAt > ALIGN_COOLDOWN_MS) {
+                alignState.lastSig = sig
+                alignState.lastAt = Date.now()
+                const startedJob = await startAlignJob(eff, both)
+                if (startedJob) result.align = { jobId: startedJob.id, bothModified: both.map(f => f.shadowPath) }
+              }
             }
           }
-          // 每日自动快照（本地滚动，勾选云端才上云——自动快照只落本地）
+          state.lastSyncAt = new Date().toISOString()
+          // 每日自动快照（本地滚动，勾选云端才上云——自动快照只落本地）。
+          // 与协议无关：git / webdav / local 任一启用都执行。
           if (eff.snapshotAuto !== false) {
             const today = new Date().toISOString().slice(0, 10)
             if (state.lastAutoSnapshotDate !== today) {
@@ -1583,6 +1734,11 @@ module.exports = {
                 await saveState()
               } catch (e) { ctx.logger.warn(`dsh-sync: auto snapshot: ${e && e.message}`) }
             }
+          }
+          // 纯备份协议（webdav/local）：把启用类别按 git backup 同款布局镜像上去
+          if (backupProtos.length > 0) {
+            result.backup = await runBackupUpload(eff, { instanceId: state.instanceId, syncDir, roots: defaultRoots() }, { force: forceBackup })
+              .catch(e => { ctx.logger.warn(`dsh-sync: backup upload: ${e && e.message}`); return { error: String(e && e.message) } })
           }
           try { await pruneLocalSnapshots(join(syncDir, 'snapshots'), eff.snapshotLocalKeep || 30, state.cloudSnapshots) } catch {}
           state.lastResult = { ...result, at: state.lastSyncAt, durationMs: Date.now() - started }
@@ -1629,6 +1785,7 @@ module.exports = {
       const prompt = substituteParams(ALIGN_PROMPT_ZH, {
         shadowDir: repoDir,
         skillsDsh: roots.dshSkills, skillsAgents: roots.agentsSkills,
+        skillsHomeAgents: roots.homeAgentsSkills,
         sessions: roots.sessions, settingsFile: roots.settingsFile, profiles: roots.profiles,
         backupDir, apiBase: APIPROXY_BASE, token: eff.token,
         fileCount: both.length, fileList,
@@ -1735,7 +1892,7 @@ module.exports = {
           if (req.method === 'GET' && apiPath.endsWith('/dsh-sync/api/status')) {
             await stateLoaded
             const eff = syncSettings()
-            const { token, ...safe } = eff
+            const { token, webdavPassword: _wdvPw, ...safe } = eff
             const repoExists = await fsP.access(join(repoDir, '.git')).then(() => true).catch(() => false)
             sendJson(res, 200, {
               repoUrl: eff.repoUrl, branch: eff.branch, dir: displayPath(repoDir), repoExists,
@@ -1755,6 +1912,14 @@ module.exports = {
               snapshot: { skills: eff.snapshotSkills === true, auto: eff.snapshotAuto !== false, localKeep: eff.snapshotLocalKeep || 30 },
               hasToken: typeof token === 'string' && token !== '',
               syncing: syncRun !== null,
+              // 多协议状态：git 完整同步；webdav/local 纯备份目标
+              gitEnabled: gitProtocolOn(eff),
+              protocols: {
+                git: { enabled: eff.gitEnabled !== false, configured: !!(eff.repoUrl && token) },
+                webdav: { enabled: !!eff.webdavEnabled, configured: !!eff.webdavUrl, url: eff.webdavUrl || '', username: eff.webdavUsername || '', dir: eff.webdavDir || 'dsh-sync', hasPassword: !!eff.webdavPassword },
+                local: { enabled: !!eff.localEnabled, configured: !!eff.localDir, dir: eff.localDir || '' },
+              },
+              lastBackup: (state.lastResult && state.lastResult.backup) || null,
               pendingConflict: state.lastResult && state.lastResult.push && state.lastResult.push.conflict === true
                 ? { branch: state.lastPushedBranch, prNumber: state.lastPrNumber } : null,
               bothModifiedPending: Object.keys(state.pendingBoth && typeof state.pendingBoth === 'object' ? state.pendingBoth : {}),
@@ -1788,14 +1953,23 @@ module.exports = {
               if (typeof body[key] === 'boolean') patch[key] = body[key]
             }
             if (typeof body.snapshotLocalKeep === 'number' && body.snapshotLocalKeep >= 1) patch.snapshotLocalKeep = Math.floor(body.snapshotLocalKeep)
-            for (const key of ['autoSync', 'syncOnStartup', 'syncSkills', 'syncSessions', 'syncSettings', 'syncPlugins']) {
+            for (const key of ['autoSync', 'syncOnStartup', 'syncSkills', 'syncSessions', 'syncSettings', 'syncPlugins', 'gitEnabled', 'webdavEnabled', 'localEnabled']) {
               if (typeof body[key] === 'boolean') patch[key] = body[key]
             }
             if (typeof body.intervalMinutes === 'number' && body.intervalMinutes >= 1) patch.intervalMinutes = body.intervalMinutes
+            // webdav/local 配置：空串允许（清空地址=停用该协议的一种方式）
+            for (const key of ['webdavUrl', 'webdavUsername', 'webdavDir', 'localDir']) {
+              if (typeof body[key] === 'string') patch[key] = body[key]
+            }
             // token: non-empty sets; null/'' clears. Never echoed.
             let clearToken = false
             if (typeof body.token === 'string' && body.token !== '') patch.token = body.token
             if (body.token === null || body.token === '') clearToken = true
+            // webdavPassword 同 token 语义：非空才覆盖、null 显式清除（整表单保存
+            // 时空串不误清已存密码）
+            let clearWebdavPassword = false
+            if (typeof body.webdavPassword === 'string' && body.webdavPassword !== '') patch.webdavPassword = body.webdavPassword
+            if (body.webdavPassword === null) clearWebdavPassword = true
             // 私仓硬校验：带 repoUrl+token（首次或换仓库）时拒绝公共仓库
             if (patch.token && (patch.repoUrl || syncSettings().repoUrl)) {
               const checkUrl = patch.repoUrl || syncSettings().repoUrl
@@ -1804,16 +1978,64 @@ module.exports = {
             }
             if (clearToken) delete settingsOverrides.token
             else Object.assign(settingsOverrides, patch)
-            // 0.1.7 持久化：平铺 patch 挂进 sync: 子对象；token 清空走 mutate.unset
+            if (clearWebdavPassword) delete settingsOverrides.webdavPassword
+            // 0.1.7 持久化：平铺 patch 挂进 sync: 子对象；token/密码清空走 mutate.unset
             if (ctx.settings && typeof ctx.settings.update === 'function') {
               try {
                 if (Object.keys(patch).length > 0) await ctx.settings.update(SYNC_SETTINGS_NS, { sync: patch })
                 if (clearToken) await ctx.settings.mutate(SYNC_SETTINGS_NS, [{ op: 'unset', path: ['sync', 'token'] }])
+                if (clearWebdavPassword) await ctx.settings.mutate(SYNC_SETTINGS_NS, [{ op: 'unset', path: ['sync', 'webdavPassword'] }])
               } catch (e) { ctx.logger.warn(`dsh-sync: settings update 失败（仅本次运行生效）: ${e && e.message}`) }
             }
             const eff = syncSettings()
-            const { token, ...safe } = eff
+            const { token, webdavPassword: _wdvPw, ...safe } = eff
             sendJson(res, 200, { settings: safe, hasToken: typeof token === 'string' && token !== '' })
+            return
+          }
+
+          // POST /dsh-sync/api/protocol/test {protocol, url?, ...} → 协议连通性
+          // 测试；body 字段覆盖已存配置（保存前就能测）。git 走私仓校验，
+          // webdav 走 PROPFIND 探测，local 走目录写探测。
+          if (req.method === 'POST' && apiPath.endsWith('/dsh-sync/api/protocol/test')) {
+            const body = await readJsonBody(req)
+            await stateLoaded
+            const eff = syncSettings()
+            const kind = body.protocol
+            if (kind === 'webdav') {
+              const url = typeof body.url === 'string' && body.url ? body.url : eff.webdavUrl
+              if (!url) { sendJson(res, 200, { ok: false, error: '缺少 WebDAV 地址' }); return }
+              try {
+                const client = createWebdavClient({
+                  url,
+                  username: typeof body.username === 'string' ? body.username : eff.webdavUsername,
+                  password: typeof body.password === 'string' && body.password !== '' ? body.password : eff.webdavPassword,
+                  basePath: typeof body.dir === 'string' && body.dir ? body.dir : eff.webdavDir,
+                })
+                sendJson(res, 200, await client.probe())
+              } catch (e) { sendJson(res, 200, { ok: false, error: String(e && e.message || e) }) }
+              return
+            }
+            if (kind === 'local') {
+              const dir = expandTilde(typeof body.dir === 'string' && body.dir ? body.dir : eff.localDir)
+              if (!dir) { sendJson(res, 200, { ok: false, error: '缺少备份目录' }); return }
+              try {
+                await fsP.mkdir(dir, { recursive: true })
+                const probe = join(dir, `.dsh-sync-probe-${randomUUID().slice(0, 8)}`)
+                await fsP.writeFile(probe, 'dsh-sync')
+                await fsP.rm(probe, { force: true })
+                sendJson(res, 200, { ok: true })
+              } catch (e) { sendJson(res, 200, { ok: false, error: String(e && e.message || e) }) }
+              return
+            }
+            if (kind === 'git') {
+              const url = typeof body.repoUrl === 'string' && body.repoUrl ? body.repoUrl : eff.repoUrl
+              const token = typeof body.token === 'string' && body.token ? body.token : eff.token
+              if (!url || !token) { sendJson(res, 200, { ok: false, error: '缺少仓库地址或访问令牌' }); return }
+              const check = await checkRepoPrivate(token, url)
+              sendJson(res, 200, { ok: !!check.ok, error: check.error })
+              return
+            }
+            sendJson(res, 400, { error: '未知协议：' + String(kind) })
             return
           }
 
@@ -1933,18 +2155,34 @@ module.exports = {
             if (dup) name = `${name}-${Date.now()}`
             const dir = await createLocalSnapshot(eff, name)
             let promoted = false, promoteResult = null
+            const protoResults = {}
             if (body.cloud === true) {
+              const protos = resolveBackupProtocols(eff)
+              const gitOn = gitProtocolOn(eff)
+              if (!gitOn && protos.length === 0) { sendJson(res, 400, { error: '没有已启用的云端协议：请先配置 Git 仓库、WebDAV 或本地文件夹' }); return }
               const release = await acquireLock(lockFile)
               if (release === null) { sendJson(res, 400, { error: '另一个同步进程正在运行，稍后再试' }); return }
               try {
-                promoteResult = await promoteSnapshotToCloud(eff.gitBinary, eff, { repoDir, instanceId: state.instanceId, state, logger: ctx.logger }, name, dir)
-                promoted = promoteResult.promoted === true
+                // git：沿用 分支→PR→合并 的云上存档路径 backup/<id>/snapshots/<名字>/
+                if (gitOn) {
+                  try {
+                    promoteResult = await promoteSnapshotToCloud(eff.gitBinary, eff, { repoDir, instanceId: state.instanceId, state, logger: ctx.logger }, name, dir)
+                    protoResults.git = { ok: promoteResult.promoted === true, merged: promoteResult.merged === true }
+                    promoted = promoted || promoteResult.promoted === true
+                  } catch (e) { protoResults.git = { ok: false, error: String(e && e.message || e) } }
+                }
+                // webdav / local：同布局 backup/<id>/snapshots/<名字>/，纯 PUT/复制
+                for (const proto of protos) {
+                  try {
+                    protoResults[proto.kind] = await promoteSnapshotToProtocol(proto, dir, { instanceId: state.instanceId, snapName: name })
+                    promoted = true
+                  } catch (e) { protoResults[proto.kind] = { ok: false, error: String(e && e.message || e) } }
+                }
                 if (promoted && !(state.cloudSnapshots || []).includes(name)) { state.cloudSnapshots.push(name); await saveState() }
-              } catch (e) { sendJson(res, 400, { error: String(e && e.message || e) }); return }
-              finally { release() }
+              } finally { release() }
             }
             const pruned = await pruneLocalSnapshots(join(syncDir, 'snapshots'), eff.snapshotLocalKeep || 30, state.cloudSnapshots).catch(() => [])
-            sendJson(res, 200, { name, promoted, promoteResult, pruned })
+            sendJson(res, 200, { name, promoted, promoteResult, protocols: protoResults, pruned })
             return
           }
 
@@ -1980,16 +2218,34 @@ module.exports = {
               if (!(state.cloudSnapshots || []).includes(name)) { sendJson(res, 404, { error: `本地与云端都没有快照 ${name}` }); return }
               const release = await acquireLock(lockFile)
               if (release === null) { sendJson(res, 400, { error: '另一个同步进程正在运行，稍后再试' }); return }
+              let fetched = false
+              const fetchErrors = []
               try {
-                const remote = authedUrl(eff.repoUrl, eff.token)
-                await gitExec(eff.gitBinary, ['fetch', remote, eff.branch], repoDir)
-                const cloudPath = `backup/${state.instanceId}/snapshots/${name}`
-                await gitExec(eff.gitBinary, ['checkout', 'FETCH_HEAD', '--', cloudPath], repoDir)
-                await copyTree(join(repoDir, cloudPath), srcDir, {})
-                await gitExec(eff.gitBinary, ['reset', '--hard', 'FETCH_HEAD'], repoDir).catch(() => {})
+                // 回退顺序 git → webdav → local：哪个协议有这份快照就从哪取
+                const gitOn = gitProtocolOn(eff)
+                if (gitOn) {
+                  try {
+                    const remote = authedUrl(eff.repoUrl, eff.token)
+                    await gitExec(eff.gitBinary, ['fetch', remote, eff.branch], repoDir)
+                    const cloudPath = `backup/${state.instanceId}/snapshots/${name}`
+                    await gitExec(eff.gitBinary, ['checkout', 'FETCH_HEAD', '--', cloudPath], repoDir)
+                    await copyTree(join(repoDir, cloudPath), srcDir, {})
+                    await gitExec(eff.gitBinary, ['reset', '--hard', 'FETCH_HEAD'], repoDir).catch(() => {})
+                    fetched = true
+                  } catch (e) { fetchErrors.push(`git: ${String(e && e.message || e)}`) }
+                }
+                if (!fetched) {
+                  for (const proto of resolveBackupProtocols(eff)) {
+                    try {
+                      await fetchSnapshotFromProtocol(proto, { instanceId: state.instanceId, snapName: name }, srcDir)
+                      fetched = true
+                      break
+                    } catch (e) { fetchErrors.push(`${proto.kind}: ${String(e && e.message || e)}`) }
+                  }
+                }
+                if (!fetched) { sendJson(res, 400, { error: `云端协议中都没有快照 ${name}（${fetchErrors.join('；') || '无已启用协议'}）` }); return }
                 if (!(state.cloudSnapshots || []).includes(name)) { state.cloudSnapshots.push(name); await saveState() }
-              } catch (e) { sendJson(res, 400, { error: String(e && e.message || e) }); return }
-              finally { release() }
+              } finally { release() }
             }
             // 恢复前给当前状态拍安全快照
             const safetyName = `pre-restore-${new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19)}`

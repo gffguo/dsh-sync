@@ -51,6 +51,7 @@ async function mkReplica(tmp, name, eff) {
     dshSkills: join(live, '.dsh', 'skills'),
     agentsSkills: join(live, '.nope-agents'),
     agentsLock: join(live, '.nope-lock'),
+    homeAgentsSkills: join(live, '.nope-home-agents'),
     sessions: join(live, '.nope-s'),
     settingsFile: join(live, '.dsh', 'settings.yaml'),
     profiles: join(live, '.nope-p'),

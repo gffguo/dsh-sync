@@ -45,14 +45,14 @@ test('authedUrl embeds token, never persists to config', () => {
 })
 
 test('syncSpec respects the four toggles', () => {
-  const roots = { dshSkills: '/dsh', agentsSkills: '/a', agentsLock: '/l', sessions: '/s', settingsFile: '/st', profiles: '/p' }
+  const roots = { dshSkills: '/dsh', agentsSkills: '/a', agentsLock: '/l', homeAgentsSkills: '/ha', sessions: '/s', settingsFile: '/st', profiles: '/p' }
   const all = I.syncSpec({ syncSkills: true, syncSessions: true, syncSettings: true, syncPlugins: true }, roots)
   assert.equal(all.length, 4)
   assert.equal(all.map(g => g.name).join(','), 'skills,sessions,settings,plugins')
   const onlySkills = I.syncSpec({ syncSkills: true, syncSessions: false, syncSettings: false, syncPlugins: false }, roots)
   assert.equal(onlySkills.length, 1)
   assert.equal(onlySkills[0].name, 'skills')
-  assert.equal(onlySkills[0].sources.length, 3)   // dsh + agents + lock
+  assert.equal(onlySkills[0].sources.length, 4)   // dsh + agents + agents-home + lock
 })
 
 // ── copyTree / mirror / resolve ─────────────────────────────────────────
@@ -85,28 +85,37 @@ test('mirrorLiveToShadow + resolveLivePath round-trip', async () => {
   // skills group
   await fsp.mkdir(join(live, 'skills', 'foo'), { recursive: true })
   await fsp.writeFile(join(live, 'skills', 'foo', 'SKILL.md'), '# foo')
+  // ~/agents/skills（无点目录）根
+  await fsp.mkdir(join(live, 'agents-home', 'bar'), { recursive: true })
+  await fsp.writeFile(join(live, 'agents-home', 'bar', 'SKILL.md'), '# bar')
   await fsp.writeFile(join(live, 'settings.yaml'), 'k: v')
   const roots = {
     dshSkills: join(live, 'skills'), agentsSkills: join(live, 'nope-agents'),
-    agentsLock: join(live, 'nope-lock'), sessions: join(live, 'nope-s'),
+    agentsLock: join(live, 'nope-lock'), homeAgentsSkills: join(live, 'agents-home'),
+    sessions: join(live, 'nope-s'),
     settingsFile: join(live, 'settings.yaml'), profiles: join(live, 'nope-p'),
   }
   const spec = I.syncSpec({ syncSkills: true, syncSessions: false, syncSettings: true, syncPlugins: false, settingsStrategy: 'union' }, roots)
   await I.mirrorLiveToShadow(spec, shadow)
   assert.equal(fs.readFileSync(join(shadow, 'skills', 'dsh', 'foo', 'SKILL.md'), 'utf8'), '# foo')
+  assert.equal(fs.readFileSync(join(shadow, 'skills', 'agents-home', 'bar', 'SKILL.md'), 'utf8'), '# bar')
   assert.equal(fs.readFileSync(join(shadow, 'settings', 'settings.yaml'), 'utf8'), 'k: v')
   // backup 策略：写入 backup/<instanceId>/ 前缀，strategyForPath 可查
   const bspec = I.syncSpec({ syncSkills: true, syncSessions: false, syncSettings: true, syncPlugins: false, settingsStrategy: 'backup', skillsStrategy: 'backup' }, roots, 'inst-9')
   assert.equal(bspec[0].strategy, 'backup')
   assert.equal(bspec[1].sources[0].to, 'backup/inst-9/settings/settings.yaml')
   assert.equal(I.strategyForPath(bspec, 'backup/inst-9/skills/dsh/foo/SKILL.md'), 'backup')
+  assert.equal(I.strategyForPath(bspec, 'backup/inst-9/skills/agents-home/bar/SKILL.md'), 'backup')
   assert.equal(I.strategyForPath(spec, 'skills/dsh/foo/SKILL.md'), 'union')
   assert.equal(I.strategyForPath(spec, 'outside/path'), undefined)
   const bshadow = join(tmp, 'bshadow')
   await I.mirrorLiveToShadow(bspec, bshadow)
   assert.equal(fs.readFileSync(join(bshadow, 'backup', 'inst-9', 'settings', 'settings.yaml'), 'utf8'), 'k: v')
-  // reverse-resolve
+  assert.equal(fs.readFileSync(join(bshadow, 'backup', 'inst-9', 'skills', 'agents-home', 'bar', 'SKILL.md'), 'utf8'), '# bar')
+  // reverse-resolve（agents-home 与 agents 互不串扰）
   assert.equal(I.resolveLivePath(spec, 'skills/dsh/foo/SKILL.md'), join(live, 'skills', 'foo', 'SKILL.md'))
+  assert.equal(I.resolveLivePath(spec, 'skills/agents-home/bar/SKILL.md'), join(live, 'agents-home', 'bar', 'SKILL.md'))
+  assert.equal(I.resolveLivePath(spec, 'skills/agents/whatever'), join(live, 'nope-agents', 'whatever'))
   assert.equal(I.resolveLivePath(spec, 'settings/settings.yaml'), join(live, 'settings.yaml'))
   assert.equal(I.resolveLivePath(spec, 'unknown/path'), undefined)
 })
@@ -170,11 +179,14 @@ test('runPush: mirrors live → branch → PR → merge (mocked REST)', async ()
   // 2. live roots
   await fsp.mkdir(join(live, '.dsh', 'skills', 'foo'), { recursive: true })
   await fsp.writeFile(join(live, '.dsh', 'skills', 'foo', 'SKILL.md'), '---\nname: foo\n---\n# foo')
+  await fsp.mkdir(join(live, 'agents', 'skills', 'baz'), { recursive: true })
+  await fsp.writeFile(join(live, 'agents', 'skills', 'baz', 'SKILL.md'), '---\nname: baz\n---\n# baz')
   await fsp.writeFile(join(live, '.dsh', 'settings.yaml'), 'provider: zhanlu\n')
   const roots = {
     dshSkills: join(live, '.dsh', 'skills'),
     agentsSkills: join(live, '.nope-agents'),
     agentsLock: join(live, '.nope-lock'),
+    homeAgentsSkills: join(live, 'agents', 'skills'),
     sessions: join(live, '.nope-s'),
     settingsFile: join(live, '.dsh', 'settings.yaml'),
     profiles: join(live, '.nope-p'),
@@ -207,6 +219,9 @@ test('runPush: mirrors live → branch → PR → merge (mocked REST)', async ()
     // the live files landed in that branch's tree
     const blob = await new Promise((res, rej) => execFile('git', ['show', `${state.lastPushedBranch}:skills/dsh/foo/SKILL.md`], { cwd: repoDir }, (e, o) => e ? rej(e) : res(String(o))))
     assert.ok(blob.includes('# foo'), 'live skill content committed to branch')
+    // ~/agents/skills landed under skills/agents-home/
+    const homeBlob = await new Promise((res, rej) => execFile('git', ['show', `${state.lastPushedBranch}:skills/agents-home/baz/SKILL.md`], { cwd: repoDir }, (e, o) => e ? rej(e) : res(String(o))))
+    assert.ok(homeBlob.includes('# baz'), '~/agents/skills content committed under skills/agents-home')
     // settings.yaml mirrored too
     const stBlob = await new Promise((res, rej) => execFile('git', ['show', `${state.lastPushedBranch}:settings/settings.yaml`], { cwd: repoDir }, (e, o) => e ? rej(e) : res(String(o))))
     assert.equal(stBlob, 'provider: zhanlu\n')
@@ -243,6 +258,7 @@ test('reconcileRemote: pulls remote-only adds into live, never overwrites local 
     dshSkills: join(live, '.dsh', 'skills'),
     agentsSkills: join(live, '.nope-agents'),
     agentsLock: join(live, '.nope-lock'),
+    homeAgentsSkills: join(live, '.nope-home-agents'),
     sessions: join(live, '.nope-s'),
     settingsFile: join(live, '.dsh', 'settings.yaml'),
     profiles: join(live, '.nope-p'),
@@ -308,6 +324,7 @@ test('runPush preserve: both-modified files keep the remote version on the branc
     dshSkills: join(live, '.dsh', 'skills'),
     agentsSkills: join(live, '.nope-agents'),
     agentsLock: join(live, '.nope-lock'),
+    homeAgentsSkills: join(live, '.nope-home-agents'),
     sessions: join(live, '.nope-s'),
     settingsFile: join(live, '.dsh', 'settings.yaml'),
     profiles: join(live, '.nope-p'),
@@ -370,6 +387,7 @@ test('runPush first join: remote-only files kept, differing settings.yaml protec
     dshSkills: join(live, '.dsh', 'skills'),
     agentsSkills: join(live, '.nope-agents'),
     agentsLock: join(live, '.nope-lock'),
+    homeAgentsSkills: join(live, '.nope-home-agents'),
     sessions: join(live, '.nope-s'),
     settingsFile: join(live, '.dsh', 'settings.yaml'),
     profiles: join(live, '.nope-p'),
@@ -461,6 +479,7 @@ test('reconcileRemote: existing plugin manifest kept, new plugin files applied',
     dshSkills: join(live, '.dsh', 'skills'),
     agentsSkills: join(live, '.nope-agents'),
     agentsLock: join(live, '.nope-lock'),
+    homeAgentsSkills: join(live, '.nope-home-agents'),
     sessions: join(live, '.nope-s'),
     settingsFile: join(live, '.nope-settings'),
     profiles: join(live, '.dsh', 'profiles'),
@@ -514,6 +533,7 @@ test('reconcile keeps per-file baseline for unresolved bothModified across syncs
     dshSkills: join(live, '.dsh', 'skills'),
     agentsSkills: join(live, '.nope-agents'),
     agentsLock: join(live, '.nope-lock'),
+    homeAgentsSkills: join(live, '.nope-home-agents'),
     sessions: join(live, '.nope-s'),
     settingsFile: join(live, '.nope-settings'),
     profiles: join(live, '.nope-p'),
