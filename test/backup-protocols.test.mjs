@@ -30,6 +30,15 @@ const B = require('../src/backup.js')
 
 const mkdtemp = async () => fsp.mkdtemp(join(tmpdir(), 'dshsync-bp-'))
 const write = async (p, s) => { await fsp.mkdir(join(p, '..'), { recursive: true }); await fsp.writeFile(p, s) }
+/** 一个"已关闭"的真实端口：连接立刻被 RST（写死 127.0.0.1:1 这类低端口在
+ *  CI runner 上的防火墙行为不可控，曾让 wire 测试在 GitHub Actions 挂死）。 */
+async function mkDeadUrl() {
+  const s = createServer(() => {})
+  await new Promise((fulfil) => s.listen(0, '127.0.0.1', fulfil))
+  const url = 'http://127.0.0.1:' + s.address().port
+  await new Promise((fulfil) => s.close(fulfil))
+  return url
+}
 
 // ── 伪 WebDAV 服务器：内存树 + 真 HTTP ───────────────────────────────────
 
@@ -347,7 +356,7 @@ test('runBackupUpload: single protocol failure does not affect the other', async
     }
     const eff = { syncSkills: true, syncSessions: false, syncSettings: true, syncPlugins: false }
     // webdav 指向已关闭端口 → 失败；local 指向 tmp → 成功
-    const deadUrl = 'http://127.0.0.1:1'
+    const deadUrl = await mkDeadUrl()
     const effWd = { ...eff, webdavEnabled: true, webdavUrl: deadUrl, localEnabled: true, localDir: join(tmp, 'lt') }
     const out = await I.runBackupUpload(effWd, { instanceId: 'inst-3', syncDir: join(tmp, 'sd'), roots })
     assert.equal(out.local.ok, true)
@@ -395,7 +404,10 @@ test('snapshot promote + fetch roundtrip via webdav and local', async () => {
 
 function makeHarness(config = {}) {
   const routes = []
-  const doc = { sync: JSON.parse(JSON.stringify(config)) }
+  // 默认关掉调度器：apply() 会 fire startup auto-sync，与测试自身的 POST /sync
+  // 抢同一把锁/同一个 syncRun，在 CI 上制造过 20 分钟的测试间卡死（真机实证）。
+  // 需要验证调度行为的用例显式传 autoSync 覆盖。
+  const doc = { sync: { autoSync: false, syncOnStartup: false, ...JSON.parse(JSON.stringify(config)) } }
   const ctx = {
     logger: { info() {}, warn() {}, error() {} },
     settings: {
@@ -472,7 +484,7 @@ test('status reflects protocol state; sync without any protocol is refused', asy
   // 只配了 webdav（无 git）→ sync 不再因缺 git 仓库而被拒（仓库不可达记为该协议备份失败）
   // staging 里放一个 settings 文件，确保确有内容要上传（空树会零请求"成功"）
   await write(join(ISO_HOME, 'settings.yaml'), 'k: v\n')
-  const h2 = makeHarness({ webdavEnabled: true, webdavUrl: 'http://127.0.0.1:1/dav', gitEnabled: false, autoSync: false, syncSkills: false })
+  const h2 = makeHarness({ webdavEnabled: true, webdavUrl: (await mkDeadUrl()) + '/dav', gitEnabled: false, autoSync: false, syncSkills: false })
   const sync2 = await h2.call('POST', '/dsh-sync/api/sync', {})
   assert.equal(sync2.status, 200, JSON.stringify(sync2.json && sync2.json.error))
   assert.equal(sync2.json.backup.webdav.ok, false, 'unreachable webdav recorded as failed backup')

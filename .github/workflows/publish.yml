@@ -20,6 +20,9 @@ permissions:
   contents: read
   id-token: write # npm provenance / trusted publishing
 
+# 发布链路不长：超时兜底，防止测试挂死把 runner 占住 6 小时
+timeout-minutes: 15
+
 concurrency:
   group: publish-${{ github.ref }}
   cancel-in-progress: false
@@ -51,9 +54,11 @@ jobs:
         run: npm ci
 
       - name: Check & test
+        # shell timeout 双保险：node --test-timeout 管单个用例，timeout 管整个
+        # 步骤（含测试间卡死这种用例超时罩不住的情况）
         run: |
           npm run check
-          npm test
+          timeout 300 npm test
 
       - name: Skip if version already published
         id: check
