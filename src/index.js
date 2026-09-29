@@ -229,9 +229,13 @@ async function atomicWriteFile(file, content) {
 
 // ── Git CLI (token stays out of .git/config — authed URL per command) ──
 
-function gitExec(binary, args, cwd) {
+function gitExec(binary, args, cwd, authEnv) {
   return new Promise((fulfil, reject) => {
-    execFile(binary, args, { cwd, timeout: 10 * 60 * 1000, maxBuffer: 16 * 1024 * 1024 }, (error, stdout, stderr) => {
+    const opts = { cwd, timeout: 10 * 60 * 1000, maxBuffer: 16 * 1024 * 1024 }
+    // 凭据经 GIT_ASKPASS env 注入（askpass 脚本从 DSH_SYNC_TOKEN 取值）——
+    // argv 不携带 token（ps 全机可见），.git/config 也不落盘
+    if (authEnv) opts.env = { ...process.env, ...authEnv }
+    execFile(binary, args, opts, (error, stdout, stderr) => {
       if (error) {
         const tail = String(stderr || error.message || '').split(/\r?\n/).filter(Boolean).slice(-3).join(' ')
         reject(new Error(`git ${args[0]}: ${tail || error.message}`))
@@ -260,12 +264,37 @@ async function gitCurrentCommit(binary, repo) {
   try { return (await gitExec(binary, ['rev-parse', 'HEAD'], repo)).trim() } catch { return undefined }
 }
 
-/** Embed an access token in an https remote URL (gitcode/oauth2 style).
- *  Credentials stay out of .git/config — every remote-touching command
- *  receives the authed URL directly and nothing is persisted. */
-function authedUrl(url, token) {
-  if (!token) return url
-  return String(url).replace(/^(https?:\/\/)([^@/]+@)?/, `$1oauth2:${encodeURIComponent(token)}@`)
+// ── Git credentials: env-side, never argv. A git subprocess's argv is
+//    world-readable via ps, so the token must not appear there. Remote-touching
+//    commands get a clean URL plus GIT_ASKPASS: git answers its 401 credential
+//    prompt from DSH_SYNC_TOKEN, which only lives in the child's environment
+//    (readable by the process owner, not by other local users). ──
+
+const ASKPASS_SH = [
+  '#!/bin/sh',
+  '# dsh-sync askpass: username prompt → oauth2, anything else → the sync token',
+  'case "$1" in',
+  '  Username*) echo "oauth2" ;;',
+  '  *) echo "$DSH_SYNC_TOKEN" ;;',
+  'esac',
+].join('\n') + '\n'
+
+function askpassPath() { return join(dshHome(), 'dsh-sync', '.askpass.sh') }
+
+/** Install the askpass helper under $DSH_HOME/dsh-sync. Idempotent. */
+async function writeAskpass() {
+  const p = askpassPath()
+  await fsP.mkdir(join(p, '..'), { recursive: true })
+  await atomicWriteFile(p, ASKPASS_SH)
+  await fsP.chmod(p, 0o755).catch(() => {})
+  return p
+}
+
+/** Extra env for remote-touching git commands. `undefined` when no token is
+ *  configured (public/local remotes need no auth). */
+function gitAuthEnv(eff) {
+  if (!eff || !eff.token) return undefined
+  return { GIT_ASKPASS: askpassPath(), DSH_SYNC_TOKEN: String(eff.token), GIT_TERMINAL_PROMPT: '0' }
 }
 
 // ── Cross-process lock: tui + web profiles run the same $DSH_HOME, so two
@@ -490,19 +519,15 @@ function resolveLivePath(spec, shadowRel) {
 // ── Shadow repo lifecycle ──
 
 async function ensureShadowRepo(binary, eff, repoDir) {
-  const remote = authedUrl(eff.repoUrl, eff.token)
+  const remote = eff.repoUrl, authEnv = gitAuthEnv(eff)
   let exists = false
   try { await fsP.access(join(repoDir, '.git')); exists = true } catch { exists = false }
   if (!exists) {
     await fsP.rm(repoDir, { recursive: true, force: true }).catch(() => {})
     await fsP.mkdir(join(repoDir, '..'), { recursive: true })
-    // Try a shallow clone first; an empty repo (first ever sync) fails, in
-    // which case init locally and let the first push seed the remote.
+    // 干净 URL + GIT_ASKPASS：clone 不经 argv 携带凭证，.git/config 也不落盘
     try {
-      await gitExec(binary, ['clone', '-b', eff.branch, '--depth', '1', remote, repoDir])
-      // clone 会把带 token 的 URL 写进 .git/config——立刻换回干净地址，
-      // 后续 fetch/push 一律显式传 authedUrl，凭证不落盘
-      await gitExec(binary, ['remote', 'set-url', 'origin', eff.repoUrl], repoDir).catch(() => {})
+      await gitExec(binary, ['clone', '-b', eff.branch, '--depth', '1', remote, repoDir], undefined, authEnv)
     } catch {
       await fsP.mkdir(repoDir, { recursive: true })
       await gitExec(binary, ['init', '-b', eff.branch], repoDir)
@@ -517,13 +542,14 @@ async function ensureShadowRepo(binary, eff, repoDir) {
 
 async function runPush(binary, eff, { repoDir, instanceId, state, logger, roots, preserve }) {
   const remote = await ensureShadowRepo(binary, eff, repoDir)
+  const authEnv = gitAuthEnv(eff)
   const spec = syncSpec(eff, roots, instanceId)
   // 首次接入判定必须在任何基线推进之前读
   const firstJoin = !state.lastSyncedCommit
   let settingsPreserved = false
 
   // 1. fetch origin/main → FETCH_HEAD (canonical baseline)
-  try { await gitExec(binary, ['fetch', remote, eff.branch], repoDir) } catch (e) {
+  try { await gitExec(binary, ['fetch', remote, eff.branch], repoDir, authEnv) } catch (e) {
     // first-ever push to an empty remote: no main yet, skip fetch
     if (!/could ?n[o']?t find|doesn't exist|no such|unborn|empty/i.test(String(e && e.message))) throw e
   }
@@ -578,7 +604,7 @@ async function runPush(binary, eff, { repoDir, instanceId, state, logger, roots,
   if (!commitOk) return { pushed: false, nothingToCommit: true }
 
   // 5. push the branch (token in URL, not in config)
-  await gitExec(binary, ['push', remote, `HEAD:${branch}`], repoDir)
+  await gitExec(binary, ['push', remote, `HEAD:${branch}`], repoDir, authEnv)
 
   // 6. create PR + mergeable check
   const parsed = parseRepoUrl(eff.repoUrl)
@@ -586,7 +612,7 @@ async function runPush(binary, eff, { repoDir, instanceId, state, logger, roots,
     // non-GitCode remote (local test, self-hosted git): push the branch only;
     // PR create/merge is GitCode-specific and skipped. Advance shadow onto
     // main as the next cycle's pull baseline.
-    await gitExec(binary, ['fetch', remote, eff.branch], repoDir).catch(() => {})
+    await gitExec(binary, ['fetch', remote, eff.branch], repoDir, authEnv).catch(() => {})
     await gitExec(binary, ['checkout', eff.branch], repoDir).catch(() => {})
     await gitExec(binary, ['reset', '--hard', 'FETCH_HEAD'], repoDir).catch(() => {})
     state.lastSyncedCommit = await gitCurrentCommit(binary, repoDir)
@@ -618,9 +644,9 @@ async function runPush(binary, eff, { repoDir, instanceId, state, logger, roots,
     if (!mr.ok) throw new Error(`合并 PR 失败（HTTP ${mr.status}）`)
     // 合并即删远端 sync 分支（best effort）：不删的话每次同步遗留一个分支，
     // 真机仓库实测两天积了 970+ 个 sync/* 分支
-    await gitExec(binary, ['push', remote, '--delete', branch], repoDir).catch(() => {})
+    await gitExec(binary, ['push', remote, '--delete', branch], repoDir, authEnv).catch(() => {})
     // advance shadow to the merged main
-    await gitExec(binary, ['fetch', remote, eff.branch], repoDir).catch(() => {})
+    await gitExec(binary, ['fetch', remote, eff.branch], repoDir, authEnv).catch(() => {})
     await gitExec(binary, ['checkout', eff.branch], repoDir).catch(() => {})
     await gitExec(binary, ['reset', '--hard', 'FETCH_HEAD'], repoDir).catch(() => {})
     state.lastSyncedCommit = await gitCurrentCommit(binary, repoDir)
@@ -633,10 +659,10 @@ async function runPush(binary, eff, { repoDir, instanceId, state, logger, roots,
 // ── Three-way pull: remote deltas → live, only for untouched files ──
 
 async function runPull(binary, eff, { repoDir, state, logger, roots }) {
-  const remote = authedUrl(eff.repoUrl, eff.token)
+  const remote = eff.repoUrl, authEnv = gitAuthEnv(eff)
   const spec = syncSpec(eff, roots, state.instanceId)
   const lastSynced = state.lastSyncedCommit
-  try { await gitExec(binary, ['fetch', remote, eff.branch], repoDir) } catch (e) {
+  try { await gitExec(binary, ['fetch', remote, eff.branch], repoDir, authEnv) } catch (e) {
     if (!/Could not find|doesn't exist|empty/i.test(String(e && e.message))) throw e
     return { pulled: false, empty: true }
   }
@@ -744,9 +770,9 @@ function relFrom(p, base) {
 async function reconcileRemote(binary, eff, { repoDir, state, logger, roots }) {
   const fs = require('node:fs')
   try { await fs.promises.access(join(repoDir, '.git')) } catch { return { reconciled: false, noShadow: true } }
-  const remote = authedUrl(eff.repoUrl, eff.token)
+  const remote = eff.repoUrl, authEnv = gitAuthEnv(eff)
   const spec = syncSpec(eff, roots, state.instanceId)
-  try { await gitExec(binary, ['fetch', remote, eff.branch], repoDir) } catch (e) {
+  try { await gitExec(binary, ['fetch', remote, eff.branch], repoDir, authEnv) } catch (e) {
     if (!/could ?n[o']?t find|doesn't exist|no such|unborn|empty/i.test(String(e && e.message))) throw e
     return { reconciled: false, empty: true }
   }
@@ -877,8 +903,8 @@ async function pruneLocalSnapshots(snapshotsDir, keep, cloudNames) {
 /** 勾选了云端：把本地快照目录写进影子仓库 backup/<实例ID>/snapshots/<名字>/
  *  并走一次 分支 → PR → 合并（非 GitCode 远端退化为推分支）。 */
 async function promoteSnapshotToCloud(binary, eff, { repoDir, instanceId, state, logger }, snapName, srcDir) {
-  const remote = authedUrl(eff.repoUrl, eff.token)
-  try { await gitExec(binary, ['fetch', remote, eff.branch], repoDir) } catch (e) {
+  const remote = eff.repoUrl, authEnv = gitAuthEnv(eff)
+  try { await gitExec(binary, ['fetch', remote, eff.branch], repoDir, authEnv) } catch (e) {
     if (!/could ?n[o']?t find|doesn't exist|no such|unborn|empty/i.test(String(e && e.message))) throw e
   }
   const hasRemote = await gitExec(binary, ['rev-parse', '--verify', 'FETCH_HEAD'], repoDir).then(() => true).catch(() => false)
@@ -894,11 +920,11 @@ async function promoteSnapshotToCloud(binary, eff, { repoDir, instanceId, state,
   } catch {
     return { promoted: false, nothingToCommit: true }
   }
-  await gitExec(binary, ['push', remote, `HEAD:${branch}`], repoDir)
+  await gitExec(binary, ['push', remote, `HEAD:${branch}`], repoDir, authEnv)
   const parsed = parseRepoUrl(eff.repoUrl)
   if (!parsed) {
     // 非 GitCode 远端：推分支后把影子基线推进到 main（与 runPush 的 prSkipped 路径一致）
-    await gitExec(binary, ['fetch', remote, eff.branch], repoDir).catch(() => {})
+    await gitExec(binary, ['fetch', remote, eff.branch], repoDir, authEnv).catch(() => {})
     await gitExec(binary, ['checkout', eff.branch], repoDir).catch(() => {})
     await gitExec(binary, ['reset', '--hard', 'FETCH_HEAD'], repoDir).catch(() => {})
     state.lastSyncedCommit = await gitCurrentCommit(binary, repoDir)
@@ -915,8 +941,8 @@ async function promoteSnapshotToCloud(binary, eff, { repoDir, instanceId, state,
       merged = !!mr.ok
     }
   } catch {}
-  if (merged) await gitExec(binary, ['push', remote, '--delete', branch], repoDir).catch(() => {})
-  await gitExec(binary, ['fetch', remote, eff.branch], repoDir).catch(() => {})
+  if (merged) await gitExec(binary, ['push', remote, '--delete', branch], repoDir, authEnv).catch(() => {})
+  await gitExec(binary, ['fetch', remote, eff.branch], repoDir, authEnv).catch(() => {})
   await gitExec(binary, ['checkout', eff.branch], repoDir).catch(() => {})
   await gitExec(binary, ['reset', '--hard', 'FETCH_HEAD'], repoDir).catch(() => {})
   state.lastSyncedCommit = await gitCurrentCommit(binary, repoDir)
@@ -1116,9 +1142,9 @@ function parseLsTree(raw) {
  *  is untouched, so the sync loop's fetch→checkout→reset sequence can't be
  *  disturbed by a concurrent browse. */
 async function fetchBrowseRef(binary, eff, repoDir) {
-  const remote = authedUrl(eff.repoUrl, eff.token)
+  const remote = eff.repoUrl, authEnv = gitAuthEnv(eff)
   try {
-    await gitExec(binary, ['fetch', remote, `${eff.branch}:${BROWSE_REF}`], repoDir)
+    await gitExec(binary, ['fetch', remote, `${eff.branch}:${BROWSE_REF}`], repoDir, authEnv)
     return true
   } catch (e) {
     if (/Could not find|doesn't exist|empty|unborn/i.test(String(e && e.message))) return false
@@ -1245,37 +1271,32 @@ async function applyRemotePullPlan(binary, eff, { repoDir, state, roots }, plan)
 }
 
 // ── Conflict-resolution action button: in-process agent (same channel as
-//    skills-management share-run). The agent operates the shadow repo's git
-//    directly + merges the PR via REST. Only this step needs semantic
-//    judgement — everything deterministic stayed in the CLI. ──
+//    skills-management share-run). Credential steps (fetch/checkout/merge
+//    prepare, push, PR query/merge) stay in the host — the agent only does
+//    the semantic conflict resolution on the prepared working tree, so no
+//    token ever enters the prompt (issue #9). ──
 
 const CONFLICT_PROMPT_ZH = [
-  '请解决 dsh-sync 同步仓库的冲突 PR，使该 PR 可被合并，然后合并它。',
+  '请解决 dsh-sync 同步仓库的冲突：本地工作树已处于合并冲突状态，逐文件分析取舍，解完后提交。',
   '',
   '## 关键信息',
-  '- 同步仓库：{{repoUrl}}（GitCode，API base = https://api.gitcode.com）',
-  '- 本地工作树（影子仓库）：{{shadowDir}}（需 checkout 到冲突分支 {{branch}}）',
-  '- PR 编号：#{{prNumber}}',
-  '- 访问令牌：{{token}}（下方步骤直接用此字符串，不要 printenv、不要回显明文）。',
+  '- 本地工作树（影子仓库）：{{shadowDir}}（已 checkout 到分支 {{branch}}，系统已执行 merge 并留下冲突）',
+  '- 对应远端 PR：#{{prNumber}}（同步仓库 {{repoUrl}}）',
   '',
   '## 工具限制（硬性）',
-  '- 只允许使用 bash（git/curl 命令）和 HTTP 请求工具。',
+  '- 只允许使用 bash 执行**本地** git 与文件命令（status/diff/show/add/commit 等）。',
+  '- **严禁一切网络操作**：不要 git fetch / git pull / git push / git remote / curl / wget 等。推送与 PR 合并由系统在提交完成后自动完成。',
   '- **严禁**使用任何 return / deliver / 投递 / IM 文件类工具（如 dsh_im_return_file）。不要把任何文件“投递”或“返回”出去。',
-  '- **不要读取 ~/.dsh/settings.yaml**——token 已在上方给你，别碰配置文件。',
-  '- token 是敏感凭据，任何输出、日志、结果里都不要回显其明文。',
+  '- **不要读取任何配置文件或凭据**（如 ~/.dsh/settings.yaml）：本任务不需要任何令牌。',
   '',
   '## 执行步骤',
-  '1. token 已在上方「访问令牌」行给出，后续步骤直接用该字符串（不要 printenv）。',
-  '2. 在影子仓库内：`cd {{shadowDir}} && git fetch https://oauth2:{{token}}@gitcode.com/<owner>/<repo>.git main`（token 嵌 URL、不落 .git/config），然后 `git checkout {{branch}}`，再 `git merge FETCH_HEAD` 触发冲突。',
-  '3. 查看冲突文件：`git diff --name-only --diff-filter=U` 和 `git status`。对每个冲突文件分析两边版本决定取舍或合并（保留两边有效改动；README 等无语义文件取任一即可）。',
-  '4. 解决后：`git add -A && git -c user.name=dsh-sync -c user.email=dsh-sync@local commit --no-edit`，再 `git push https://oauth2:{{token}}@gitcode.com/<owner>/<repo>.git HEAD:{{branch}}`。',
-  '5. 查 PR 可合并：`curl -s -H "PRIVATE-TOKEN: {{token}}" https://api.gitcode.com/api/v5/repos/<owner>/<repo>/pulls/{{prNumber}}`，确认 mergeable 为 true。',
-  '6. 合并：`curl -s -X PUT -H "PRIVATE-TOKEN: {{token}}" -H "Content-Type: application/json" -d \'{"merge_method":"squash"}\' https://api.gitcode.com/api/v5/repos/<owner>/<repo>/pulls/{{prNumber}}/merge`。',
-  '7. 完成后输出 PR 网页链接。',
+  '1. `cd {{shadowDir}} && git status`，用 `git diff --name-only --diff-filter=U` 列出冲突文件。',
+  '2. 对每个冲突文件：读文件内容看 `<<<<<<<` 冲突标记，结合 `git log --oneline -5` 与 `git diff` 理解两边改动意图，决定取舍或融合（保留两边有效改动；README 等无语义文件取任一即可）。',
+  '3. 全部解决后：`git add -A && git -c user.name=dsh-sync -c user.email=dsh-sync@local commit --no-edit`。',
+  '4. 汇报：每个冲突文件怎么处理的、最终提交的哈希。**不要尝试推送**——系统会自动 push 并合并 PR。',
   '',
   '## 注意',
-  '- 认证头必须用 PRIVATE-TOKEN（不要用 Authorization: Bearer，GitCode 子资源端点对 Bearer 有 bug 会 404）。',
-  '- 不读 settings.yaml；不回显 token；不用投递类工具。',
+  '- 若 merge 已由系统自动完成（无冲突遗留），确认工作区干净即可，无需提交。',
   '- 若失败先看错误信息，不盲目重试。全程与最终汇报都使用中文。',
 ].join('\n')
 
@@ -1287,14 +1308,75 @@ function substituteParams(template, params) {
   return out
 }
 
+// ── Host-side conflict prepare/finalize (issue #9): all credential-touching
+//    steps (authed fetch/push, PR query/merge) run here in the dsh web
+//    process. The agent only resolves conflicts in the prepared tree, so the
+//    token never enters the prompt/model context. ──
+
+/** Fetch the sync branch + canonical branch, checkout the branch tip and
+ *  merge the canonical branch into it — leaving a conflicted working tree
+ *  for the agent. Returns { autoMerged, conflicts }: autoMerged=true means
+ *  the merge went through cleanly (PR should be mergeable now — skip the
+ *  agent and go straight to finalize). */
+async function prepareConflictTree(binary, eff, { repoDir, branch }) {
+  const remote = eff.repoUrl, authEnv = gitAuthEnv(eff)
+  await gitExec(binary, ['fetch', remote, branch], repoDir, authEnv)
+  const tip = (await gitExec(binary, ['rev-parse', 'FETCH_HEAD'], repoDir)).trim()
+  await gitExec(binary, ['checkout', '-B', branch, tip], repoDir)
+  await gitExec(binary, ['fetch', remote, eff.branch], repoDir, authEnv)
+  let merged = false
+  try { await gitExec(binary, ['merge', '--no-edit', 'FETCH_HEAD'], repoDir); merged = true } catch { /* conflicts left in the tree */ }
+  const raw = await gitExec(binary, ['diff', '--name-only', '--diff-filter=U'], repoDir).catch(() => '')
+  const conflicts = String(raw || '').split(/\r?\n/).map(s => s.trim()).filter(Boolean)
+  return { autoMerged: merged && conflicts.length === 0, conflicts }
+}
+
+/** Push the resolved branch, wait for the PR to report mergeable, squash-merge
+ *  it, delete the remote sync branch and advance the shadow baseline onto the
+ *  canonical branch. Non-GitCode remotes (local test bare repos): push only —
+ *  the PR REST surface doesn't exist there. */
+async function finalizeConflictBranch(binary, eff, { repoDir, branch, prNumber, state, logger }) {
+  const log = (m) => { if (logger && logger.warn) logger.warn(m) }
+  const remote = eff.repoUrl, authEnv = gitAuthEnv(eff)
+  const unmerged = await gitExec(binary, ['diff', '--name-only', '--diff-filter=U'], repoDir).catch(() => '')
+  if (String(unmerged || '').trim()) return { merged: false, reason: '仍有未解决的冲突文件：' + String(unmerged).trim().slice(0, 300) }
+  // agent 工作期间（无锁阶段）若有并发自动同步重置了影子仓库，HEAD 已不在目标
+  // 分支上——此时推送的是错误内容，明确失败让用户重新发起，而不是静默推错
+  const cur = (await gitExec(binary, ['rev-parse', '--abbrev-ref', 'HEAD'], repoDir).catch(() => '')).trim()
+  if (cur !== branch) return { merged: false, reason: `影子仓库当前在 ${cur || 'detached HEAD'}，不在分支 ${branch}（可能被并发同步重置）——请重新发起冲突处理` }
+  await gitExec(binary, ['push', remote, `HEAD:${branch}`], repoDir, authEnv)
+  const parsed = parseRepoUrl(eff.repoUrl)
+  if (!parsed) return { merged: true, prSkipped: true }
+  // mergeable 是异步计算的：push 后轮询等它翻转（最多 ~15s）
+  let mergeable = false, stillConflicted = false
+  for (let i = 0; i < 5; i++) {
+    if (i > 0) await new Promise(r => setTimeout(r, 3000))
+    try {
+      const det = await getPullRequest(eff.token, parsed.owner, parsed.repo, prNumber)
+      if (det.ok && det.json && det.json.mergeable === true) { mergeable = true; break }
+      if (det.ok && det.json && det.json.mergeable === false) { stillConflicted = true; break }
+    } catch (e) { log(`dsh-sync: PR 轮询失败：${e && e.message}`) }
+  }
+  if (!mergeable) return { merged: false, reason: stillConflicted ? 'PR 仍报 mergeable=false（冲突可能未全部解决）' : 'PR mergeable 状态超时未就绪' }
+  const mr = await mergePullRequest(eff.token, parsed.owner, parsed.repo, prNumber, 'squash')
+  if (!mr.ok) return { merged: false, reason: `合并 PR 失败（HTTP ${mr.status}）` }
+  // 合并即删远端 sync 分支 + 影子基线推进到 main（与 runPush 合并路径一致）
+  await gitExec(binary, ['push', remote, '--delete', branch], repoDir, authEnv).catch(() => {})
+  await gitExec(binary, ['fetch', remote, eff.branch], repoDir, authEnv).catch(() => {})
+  await gitExec(binary, ['checkout', eff.branch], repoDir).catch(() => {})
+  await gitExec(binary, ['reset', '--hard', 'FETCH_HEAD'], repoDir).catch(() => {})
+  if (state) state.lastSyncedCommit = await gitCurrentCommit(binary, repoDir)
+  return { merged: true, prNumber }
+}
+
 // ── AI align action button: semantic merge of files both sides changed.
 //    Deterministic reconcile (remote-only pull-back) already ran in the host
 //    before this prompt is built; the agent only does the semantic judgement
-//    on the reported both-modified files, then triggers a normal sync and
-//    falls back to conflict resolution if a PR still can't merge. ──
+//    on the reported both-modified files. Push + PR handling stay in the host
+//    (post-align sync fires from job onFinish) — no token in the prompt. ──
 
 const ALIGN_PROMPT_ZH = [
-  '请执行 dsh-sync 的「AI 智能对齐」：把本机与远端都改过的文件做语义合并，然后触发一次同步完成推送。',
+  '请执行 dsh-sync 的「AI 智能对齐」：把本机与远端都改过的文件做语义合并，写入本机对应文件。同步推送由系统在结束后自动完成。',
   '',
   '## 路径信息',
   '- 影子仓库（git 工作树，只读用于取版本）：{{shadowDir}}',
@@ -1307,8 +1389,6 @@ const ALIGN_PROMPT_ZH = [
   '  - 插件清单：{{profiles}}',
   '- 影子路径 → live 路径映射：`skills/dsh/**` → 技能（dsh）根；`skills/agents/**` → 技能（agents）根；`skills/agents-home/**` → 技能（agents-home）根；`skills/.skill-lock.json` → agents 根下 `.skill-lock.json`；`sessions/**` → 会话根；`settings/settings.yaml` → 设置文件；`plugins/**` → 插件清单根。',
   '- 备份目录：{{backupDir}}（改动前把 live 原文件按影子相对路径复制进去）',
-  '- 本机 dsh web 地址：{{apiBase}}（用它触发同步，不需要令牌）',
-  '- 访问令牌：{{token}}（仅兜底直接调 GitCode API 时用，严禁回显）',
   '',
   '## 待合并文件（两边都改过，共 {{fileCount}} 个）',
   '{{fileList}}',
@@ -1321,12 +1401,10 @@ const ALIGN_PROMPT_ZH = [
   '3. 文本文件（.md/.json/.yaml/.yml/明文 .jsonl）做三方语义合并，保留两边有效改动。技能/专家目录：两边各自新增的文件取并集（都保留），仅同名文件才合并内容。',
   '4. settings.yaml 逐键保留双方；本机路径/机器相关字段以本机为准；任何 token/apiKey/密钥字段保留两边但**严禁在输出中回显密钥值**。',
   '5. 二进制或压缩文件（.zst/.gz 及 session 日志二进制）不合并，保留本机版，在汇报里列出。',
-  '6. 只允许使用 bash 与 HTTP 请求工具；严禁使用 return/deliver/投递/IM 文件类工具；不要 printenv；令牌不得出现在任何输出或提交信息里。',
-  '7. 合并完成后触发确定性同步：`curl -s -X POST {{apiBase}}/dsh-sync/api/sync`，等待返回 JSON。',
-  '8. 再查状态：`curl -s {{apiBase}}/dsh-sync/api/status`。若 pendingConflict 非空（仍有冲突 PR）：在影子仓库 `git fetch https://oauth2:<令牌>@gitcode.com/<owner>/<repo>.git <分支>` → checkout 该分支 → `git merge FETCH_HEAD` → 按上述规则解冲突 → `git add -A && git -c user.name=dsh-sync -c user.email=dsh-sync@local commit --no-edit` → push 回该分支 → 调 GitCode API 合并 PR（头用 `PRIVATE-TOKEN: <令牌>`，不要用 Authorization: Bearer；`PUT /repos/<owner>/<repo>/pulls/<编号>/merge`，body `{"merge_method":"squash"}`）。',
-  '9. 全程使用中文。最后汇报：备份了哪些文件、每个文件怎么合并的、同步触发结果、PR 编号与链接（若有）。',
+  '6. 只允许使用 bash 执行**本地**命令（读文件、写文件、本地 git show）；**严禁一切网络操作**（不要 curl、不要 git fetch/pull/push、不要 printenv）；严禁使用 return/deliver/投递/IM 文件类工具；密钥值不得出现在任何输出里。',
+  '7. 全程使用中文。最后汇报：备份了哪些文件、每个文件怎么合并的。同步与推送由系统自动触发，**不要自己调用任何同步接口**。',
   '',
-  '若待合并文件清单为空，跳过合并直接执行第 7 步，并汇报同步结果。',
+  '若待合并文件清单为空，无需任何修改，直接汇报即可。',
 ].join('\n')
 
 // ── Remote align: from the browse-remote dialog, when the user picks files
@@ -1344,7 +1422,6 @@ const REMOTE_ALIGN_PROMPT_ZH = [
   '  - 设置文件：{{settingsFile}}',
   '  - 插件清单：{{profiles}}',
   '- 备份目录：{{backupDir}}（改动前把 live 原文件复制进去，保持影子相对路径的子目录结构）',
-  '- 本机 dsh web 地址：{{apiBase}}（用它触发同步，不需要令牌）',
   '',
   '## 待合并文件（共 {{fileCount}} 个）',
   '{{fileList}}',
@@ -1358,9 +1435,8 @@ const REMOTE_ALIGN_PROMPT_ZH = [
   '2. 动手前把每个 live 原文件备份到 {{backupDir}}。',
   '3. settings.yaml（YAML）：逐键合并，保留两边所有 provider/model/credential 配置；本机路径/机器相关字段以本机为准；token/apiKey/密钥字段保留两边值但**严禁在输出中回显密钥值**。',
   '4. 插件清单（package.json 等 JSON）：并集合并 dependencies，保留两边所有插件条目；版本冲突取较新者。',
-  '5. 只允许使用 bash 与 HTTP 请求工具；严禁使用 return/deliver/投递/IM 文件类工具；不要 printenv。',
-  '6. 合并完成后触发同步：`curl -s -X POST {{apiBase}}/dsh-sync/api/sync`。',
-  '7. 全程使用中文。最后汇报：备份了哪些文件、每个文件怎么合并的、同步触发结果。',
+  '5. 只允许使用 bash 执行**本地**命令（读文件、写文件、本地 git show）；**严禁一切网络操作**（不要 curl、不要 git fetch/pull/push、不要 printenv）；严禁使用 return/deliver/投递/IM 文件类工具；密钥值不得出现在任何输出里。',
+  '6. 全程使用中文。最后汇报：备份了哪些文件、每个文件怎么合并的。同步推送由系统在结束后自动触发，**不要自己调用任何同步接口**。',
 ].join('\n')
 
 // apiproxy client: dsh web 的 /api HTTP RPC（web 客户端同款），创建主对话级 session。
@@ -1435,9 +1511,10 @@ async function apiproxy(methodSlash, request) {
   return res.value
 }
 
-async function runAgentViaApiproxy({ prompt, dir, job, sessions, logger, token }) {
-  // token 经 prompt 内联（{{token}}）--apiproxy 主对话级 session 的 bash 是 host-plane
-  // executor，不继承 dsh web 进程的 process.env，故不能像 headless spawn 那样 env 注入
+async function runAgentViaApiproxy({ prompt, dir, job, sessions, logger }) {
+  // prompt 由 host 侧构建，不含任何凭据：git 推送、PR 查询/合并等需要 token 的
+  // 步骤全部由 host 完成（issue #9）——apiproxy 主对话级 session 的 bash 是
+  // host-plane executor，凭据无从注入，也不应注入
   try {
     // 1. 创建主对话级 session（有 bash）+ 发 prompt（0.1.2-rc.1：斜杠端点 + args 包裹）
     const created = await apiproxy('session/create', { cwd: dir })
@@ -1508,19 +1585,20 @@ async function runAgentViaApiproxy({ prompt, dir, job, sessions, logger, token }
   return job
 }
 
-function createAgentRunJob({ prompt, dir, jobs, logger, sessions, token, onFinish }) {
+function createAgentRunJob({ prompt, dir, jobs, logger, sessions, onFinish }) {
   const id = 'ag' + Date.now().toString(36) + Math.random().toString(36).slice(2, 8)
   const job = { id, status: 'running', startedAt: new Date().toISOString(), dir, output: '', code: null, onFinish }
   jobs.set(id, job)
   // 走 apiproxy 创建主对话级 session（standard preset + dsh-base 全工具，含 bash），
-  // 不是 agents.create 子 agent（精简无 bash）。token 注入 prompt，events 经 ctx.sessions.get 流式读。
+  // 不是 agents.create 子 agent（精简无 bash）。prompt 不含凭据（issue #9），
+  // events 经 ctx.sessions.get 流式读。
   if (!sessions || typeof sessions.get !== 'function') {
     job.status = 'error'
     job.output = 'sessions 服务不可用（动态 ctx.inject 失败）'
     if (typeof onFinish === 'function') { try { onFinish() } catch {} }
     return job
   }
-  runAgentViaApiproxy({ prompt, dir, job, sessions, logger, token })
+  runAgentViaApiproxy({ prompt, dir, job, sessions, logger })
     .catch(e => { job.status = 'error'; job.output = (job.output + '\n' + String(e && e.message)).slice(-CONFLICT_RUN_OUTPUT_CAP) })
   return job
 }
@@ -1529,7 +1607,7 @@ module.exports = {
   name: 'dsh-sync',
   inject: ['webServer', 'settings', 'connection'],
   Config: Config ?? undefined,
-  __internals: { syncSpec, defaultRoots, parseRepoUrl, authedUrl, mirrorLiveToShadow, resolveLivePath, copyTree, gitExec, acquireLock, checkRepoPrivate, gitcodeRequest, ensureShadowRepo, runPush, runPull, reconcileRemote, gitCurrentCommit, atomicWriteFile, DEFAULT_SYNC_SETTINGS, CONFLICT_PROMPT_ZH, ALIGN_PROMPT_ZH, REMOTE_ALIGN_PROMPT_ZH, substituteParams, strategyForPath, STRATEGY_VALUES, snapshotMirrorSpec, sanitizeSnapshotName, pruneLocalSnapshots, promoteSnapshotToCloud,
+  __internals: { syncSpec, defaultRoots, parseRepoUrl, gitAuthEnv, askpassPath, writeAskpass, ASKPASS_SH, mirrorLiveToShadow, resolveLivePath, copyTree, gitExec, acquireLock, checkRepoPrivate, gitcodeRequest, ensureShadowRepo, runPush, runPull, reconcileRemote, gitCurrentCommit, atomicWriteFile, DEFAULT_SYNC_SETTINGS, CONFLICT_PROMPT_ZH, ALIGN_PROMPT_ZH, REMOTE_ALIGN_PROMPT_ZH, substituteParams, prepareConflictTree, finalizeConflictBranch, strategyForPath, STRATEGY_VALUES, snapshotMirrorSpec, sanitizeSnapshotName, pruneLocalSnapshots, promoteSnapshotToCloud,
     // remote backup browser（导出供测试）
     BROWSE_REF, logicalSpec, parseRemotePath, categoryForLogical, pullSafety, parseLsTree, fetchBrowseRef, browseRemote, browseRemoteTree, expandToBlobs, planRemotePull, applyRemotePullPlan,
     // apiproxy（导出供测试：mock fetch 驱动 wire 形态回归）
@@ -1545,6 +1623,9 @@ module.exports = {
     const repoDir = join(syncDir, 'repo')
     const stateFile = join(syncDir, 'state.json')
     const lockFile = join(syncDir, '.lock')
+
+    // askpass 助手先于任何远端 git 命令落盘（GIT_ASKPASS env 注入的前提）
+    writeAskpass().catch(e => ctx.logger.warn(`dsh-sync: askpass 初始化失败: ${e && e.message}`))
 
     // ── 0.1.7 settings 接线 ──
     // 命名空间必须匹配 /^[a-z][a-z0-9-]*$/ —— 点号形式会被 settings 写入通道拒绝
@@ -1710,7 +1791,8 @@ module.exports = {
             result.push = await runPush(eff.gitBinary, eff, { ...ctx2, preserve: both.map(f => f.shadowPath) }).catch(e => { result.pushError = String(e && e.message); return null })
             result.pull = await runPull(eff.gitBinary, eff, ctx2).catch(e => { result.pullError = String(e && e.message); return null })
             // conflictMode=ai：检测到双方改动 → 自动触发 AI 智能对齐（后台 job，
-            // 会话内可追问；agent 合并完 live 文件后自己会 curl /dsh-sync/api/sync 推送）
+            // 会话内可追问；agent 只合并 live 文件，推送由 job onFinish 的 host 侧
+            // 补充同步完成——prompt 不含任何凭据）
             result.alignSkipped = autoAlign && eff.conflictMode === 'ai' && both.length > AUTO_ALIGN_MAX_FILES
               ? { reason: `bothModified ${both.length} 个，超过自动对齐规模上限 ${AUTO_ALIGN_MAX_FILES}（多为双机首次收敛 churn，非人工冲突）；保留双方版本，可到设置页手动处理` }
               : undefined
@@ -1775,11 +1857,13 @@ module.exports = {
     } catch {}
 
     // AI 智能对齐 job（手动按钮 /align/run 与自动对齐共用）：先建备份目录，再创建
-    // 主对话级 agent session 语义合并 bothModified 文件
+    // 主对话级 agent session 语义合并 bothModified 文件。凭据步骤留 host：先 fetch
+    // 把 FETCH_HEAD 预置到远端 main，agent 才能用 git show FETCH_HEAD:<path> 读远端版
     const startAlignJob = async (eff, both) => {
       const baseCommit = state.lastSyncedCommit   // 双方分叉的共同基线（reconcile 前）
       const backupDir = join(syncDir, 'align-backups', new Date().toISOString().replace(/[:.]/g, '-'))
       await fsP.mkdir(backupDir, { recursive: true })
+      await gitExec(eff.gitBinary, ['fetch', eff.repoUrl, eff.branch], repoDir, gitAuthEnv(eff)).catch(() => {})
       const fileList = both.length
         ? both.map((f, i) => `${i + 1}. ${f.shadowPath}（本机：${displayPath(f.livePath)}；该文件基线：${f.baseCommit || '同全局基线'}）`).join('\n')
         : '（无——确定性同步已处理全部差异）'
@@ -1789,7 +1873,7 @@ module.exports = {
         skillsDsh: roots.dshSkills, skillsAgents: roots.agentsSkills,
         skillsHomeAgents: roots.homeAgentsSkills,
         sessions: roots.sessions, settingsFile: roots.settingsFile, profiles: roots.profiles,
-        backupDir, apiBase: APIPROXY_BASE, token: eff.token,
+        backupDir,
         fileCount: both.length, fileList,
         lastSynced: baseCommit || '（无共同基线，仓库首次同步）',
       })
@@ -1797,12 +1881,12 @@ module.exports = {
       const job = createAgentRunJob({
         // cwd 提到 home：沙箱 workspace 必须覆盖 live 同步根、备份目录与影子仓库，
         // 否则 agent 写备份/写 live 全被拦（真机实证：cwd=影子仓库时写 ~/.dsh/dsh-sync 被拒）
-        prompt, dir: homedir(), jobs: alignRunJobs, logger: ctx.logger, sessions: sessionsSvc, token: eff.token,
+        prompt, dir: homedir(), jobs: alignRunJobs, logger: ctx.logger, sessions: sessionsSvc,
         onFinish: () => {
           alignState.active = false
           // 对齐成功 → 销账（本机版本已是语义合并结果，随下一次推送传播）+ 补一次
-          // 确定性同步把它推上去；失败则保留挂账，文件继续被 preserve 保护。
-          // 延迟 + 锁重试：agent 自己最后一步 curl 的同步可能还持着锁
+          // 确定性同步把它推上去（同步由 host 触发，agent 不再自己 curl）；失败则
+          // 保留挂账，文件继续被 preserve 保护。延迟 + 锁重试：可能有自动同步在跑
           if (job.code === 0 && both.length > 0) {
             for (const f of both) delete state.pendingBoth[f.shadowPath]
             saveState()
@@ -1838,11 +1922,11 @@ module.exports = {
       const prompt = substituteParams(REMOTE_ALIGN_PROMPT_ZH, {
         shadowDir: repoDir,
         settingsFile: roots.settingsFile, profiles: roots.profiles,
-        backupDir, apiBase: APIPROXY_BASE,
+        backupDir,
         fileCount: targets.length, fileList,
       })
       const job = createAgentRunJob({
-        prompt, dir: homedir(), jobs: remoteAlignRunJobs, logger: ctx.logger, sessions: sessionsSvc, token: eff.token,
+        prompt, dir: homedir(), jobs: remoteAlignRunJobs, logger: ctx.logger, sessions: sessionsSvc,
         onFinish: () => {
           // 对齐成功后补一次同步把合并结果推上去（延迟 + 锁重试）
           if (job.code === 0 && targets.length > 0) {
@@ -2041,20 +2125,67 @@ module.exports = {
             return
           }
 
-          // POST /dsh-sync/api/conflict/run {prNumber?, branch?} → AI resolves
+          // POST /dsh-sync/api/conflict/run {prNumber?, branch?} → AI resolves.
+          // conflictMode 是 AI 路径的总开关：manual 时所有 AI run 端点一律拒绝
+          //（issue #9：门控必须覆盖每一个入口，不能只管自动触发）。
+          // 凭据步骤全部在 host：prepare 制造冲突树 → agent 本地解冲突 → onFinish
+          // finalize（push + 查 PR + 合并）。token 不进 prompt。
           if (req.method === 'POST' && apiPath.endsWith('/dsh-sync/api/conflict/run')) {
-            const body = await readJsonBody(req)
             await stateLoaded
             const eff = syncSettings()
+            if (eff.conflictMode !== 'ai') { sendJson(res, 403, { error: 'conflictMode 为 manual，AI 冲突处理已关闭（设置页改为「ai」后可用）' }); return }
             if (!eff.repoUrl || !eff.token) { sendJson(res, 400, { error: '未配置仓库或令牌' }); return }
+            const body = await readJsonBody(req)
             const branch = body.branch || state.lastPushedBranch
             const prNumber = body.prNumber || state.lastPrNumber
             if (!branch || !prNumber) { sendJson(res, 400, { error: '没有待解决的冲突 PR' }); return }
+            // prepare 动影子仓库，与自动同步互斥：持锁做，做完释放再放 agent
+            const release = await acquireLock(lockFile)
+            if (release === null) { sendJson(res, 409, { error: '另一个同步进程正在运行，稍后再试' }); return }
+            let prep
+            try { prep = await prepareConflictTree(eff.gitBinary, eff, { repoDir, branch }) }
+            catch (e) { release(); sendJson(res, 400, { error: '准备冲突工作树失败：' + String(e && e.message || e) }); return }
+            release()
+            // finalize 收尾（两条路径共用）：push + 轮询 mergeable + squash 合并。
+            // 持锁（带重试）：影子仓库推进与自动同步互斥。
+            const finalizeJob = async (job, eff2, branch2, prNumber2) => {
+              const post = async (n) => {
+                const release2 = await acquireLock(lockFile)
+                if (release2 === null) {
+                  if (n < 4) return setTimeout(() => post(n + 1), 5000)
+                  job.status = 'error'; job.code = 1; job.output += '\n[finalize 失败] 同步锁被占，稍后可重试\n'; return
+                }
+                try {
+                  const r = await finalizeConflictBranch(eff2.gitBinary, eff2, { repoDir, branch: branch2, prNumber: prNumber2, state, logger: ctx.logger })
+                  if (r.merged) job.output += r.prSkipped ? '\n已推送分支（本地远端，无 PR 可合并）\n' : `\nPR #${prNumber2} 已合并，分支已清理\n`
+                  else { job.status = 'error'; job.code = 1; job.output += '\n[finalize 失败] ' + r.reason + '\n' }
+                } catch (e) {
+                  job.status = 'error'; job.code = 1
+                  job.output += '\n[finalize 异常] ' + String(e && e.message || e) + '\n'
+                } finally { release2() }
+              }
+              post(0)
+            }
+            if (prep.autoMerged) {
+              // merge 干净通过：PR 应已可合并，无需 agent，直接走 host finalize
+              const job = { id: 'ag' + Date.now().toString(36) + Math.random().toString(36).slice(2, 8), status: 'running', startedAt: new Date().toISOString(), dir: repoDir, output: '合并无冲突，直接推送并合并 PR…\n', code: null }
+              conflictRunJobs.set(job.id, job)
+              finalizeJob(job, eff, branch, prNumber)
+              sendJson(res, 202, { jobId: job.id, status: job.status, autoMerged: true })
+              return
+            }
             const prompt = substituteParams(CONFLICT_PROMPT_ZH, {
-              repoUrl: eff.repoUrl, shadowDir: repoDir, branch, prNumber, token: eff.token,
+              repoUrl: eff.repoUrl, shadowDir: repoDir, branch, prNumber,
             })
-            const job = createAgentRunJob({ prompt, dir: homedir(), jobs: conflictRunJobs, logger: ctx.logger, sessions: sessionsSvc, token: eff.token })
-            sendJson(res, 202, { jobId: job.id, status: job.status })
+            const job = createAgentRunJob({
+              prompt, dir: homedir(), jobs: conflictRunJobs, logger: ctx.logger, sessions: sessionsSvc,
+              onFinish: () => {
+                // agent 提交后由 host 收尾：push、轮询 mergeable、squash 合并、清分支
+                if (job.code !== 0) { job.output += '\n[agent 未正常完成，保留冲突 PR 待人工处理]\n'; return }
+                finalizeJob(job, eff, branch, prNumber)
+              },
+            })
+            sendJson(res, 202, { jobId: job.id, status: job.status, conflicts: prep.conflicts })
             return
           }
 
@@ -2073,6 +2204,7 @@ module.exports = {
           if (req.method === 'POST' && apiPath.endsWith('/dsh-sync/api/align/run')) {
             await stateLoaded
             const eff = syncSettings()
+            if (eff.conflictMode !== 'ai') { sendJson(res, 403, { error: 'conflictMode 为 manual，AI 智能对齐已关闭（设置页改为「ai」后可用）' }); return }
             if (!eff.repoUrl || !eff.token) { sendJson(res, 400, { error: '未配置仓库或令牌' }); return }
             let syncResult = null
             try { syncResult = await runSync({ autoAlign: false }) }
@@ -2116,8 +2248,8 @@ module.exports = {
             if (!parsed) { sendJson(res, 400, { error: '仅支持 GitCode 仓库' }); return }
             const hasShadow = await fsP.access(join(repoDir, '.git')).then(() => true).catch(() => false)
             if (!hasShadow) { sendJson(res, 400, { error: '影子仓库未初始化，先同步一次' }); return }
-            const remote = authedUrl(eff.repoUrl, eff.token)
-            try { await gitExec(eff.gitBinary, ['fetch', remote, eff.branch], repoDir) } catch (e) {
+            const remote = eff.repoUrl, authEnv = gitAuthEnv(eff)
+            try { await gitExec(eff.gitBinary, ['fetch', remote, eff.branch], repoDir, authEnv) } catch (e) {
               sendJson(res, 400, { error: 'fetch 失败：' + String(e && e.message || e) }); return
             }
             // 收集已合并 PR 的 head 分支（翻页直到取完，上限 20 页 × 100）
@@ -2128,7 +2260,7 @@ module.exports = {
               for (const pr of r.json) { if (pr.head && pr.head.ref) mergedHeads.add(pr.head.ref) }
               if (r.json.length < 100) break
             }
-            const ls = await gitExec(eff.gitBinary, ['ls-remote', '--heads', remote, 'refs/heads/sync/*'], repoDir).catch(() => '')
+            const ls = await gitExec(eff.gitBinary, ['ls-remote', '--heads', remote, 'refs/heads/sync/*'], repoDir, authEnv).catch(() => '')
             const refs = ls.split(/\r?\n/).map(l => l.trim()).filter(Boolean).map(l => {
               const [sha, ref] = l.split(/\t/)
               return { sha, branch: String(ref || '').replace('refs/heads/', '') }
@@ -2137,7 +2269,7 @@ module.exports = {
             for (const { branch } of refs) {
               if (!mergedHeads.has(branch)) { kept.push(branch); continue }
               try {
-                await gitExec(eff.gitBinary, ['push', remote, '--delete', branch], repoDir)
+                await gitExec(eff.gitBinary, ['push', remote, '--delete', branch], repoDir, authEnv)
                 deleted.push(branch)
               } catch (e) { errors.push(`${branch}: ${String(e && e.message || e).slice(0, 120)}`) }
             }
@@ -2227,8 +2359,8 @@ module.exports = {
                 const gitOn = gitProtocolOn(eff)
                 if (gitOn) {
                   try {
-                    const remote = authedUrl(eff.repoUrl, eff.token)
-                    await gitExec(eff.gitBinary, ['fetch', remote, eff.branch], repoDir)
+                    const remote = eff.repoUrl, authEnv = gitAuthEnv(eff)
+                    await gitExec(eff.gitBinary, ['fetch', remote, eff.branch], repoDir, authEnv)
                     const cloudPath = `backup/${state.instanceId}/snapshots/${name}`
                     await gitExec(eff.gitBinary, ['checkout', 'FETCH_HEAD', '--', cloudPath], repoDir)
                     await copyTree(join(repoDir, cloudPath), srcDir, {})
@@ -2335,6 +2467,7 @@ module.exports = {
             const body = await readJsonBody(req)
             await stateLoaded
             const eff = syncSettings()
+            if (eff.conflictMode !== 'ai') { sendJson(res, 403, { error: 'conflictMode 为 manual，AI 远端对齐已关闭（设置页改为「ai」后可用）' }); return }
             if (!eff.repoUrl || !eff.token) { sendJson(res, 400, { error: '未配置仓库或令牌' }); return }
             const hasShadow = await fsP.access(join(repoDir, '.git')).then(() => true).catch(() => false)
             if (!hasShadow) { sendJson(res, 400, { error: '影子仓库未初始化，先同步一次' }); return }

@@ -37,11 +37,34 @@ test('parseRepoUrl handles gitcode urls', () => {
   assert.equal(I.parseRepoUrl('not a url'), null)
 })
 
-test('authedUrl embeds token, never persists to config', () => {
-  assert.equal(I.authedUrl('https://gitcode.com/x/y.git', 'tok'), 'https://oauth2:tok@gitcode.com/x/y.git')
-  assert.equal(I.authedUrl('https://gitcode.com/x/y.git', ''), 'https://gitcode.com/x/y.git')
-  // existing user@info is replaced, not doubled
-  assert.equal(I.authedUrl('https://user@host/x', 't'), 'https://oauth2:t@host/x')
+test('git auth travels via GIT_ASKPASS env, never argv (issue #9)', async () => {
+  // no token configured → no env injection (public/local remotes)
+  assert.equal(I.gitAuthEnv({ token: '' }), undefined)
+  assert.equal(I.gitAuthEnv(undefined), undefined)
+  const dh = await mkdtemp()
+  const prevHome = process.env.DSH_HOME
+  process.env.DSH_HOME = dh
+  try {
+    await I.writeAskpass()
+    const env = I.gitAuthEnv({ token: 'sekret' })
+    assert.equal(env.DSH_SYNC_TOKEN, 'sekret')
+    assert.equal(env.GIT_TERMINAL_PROMPT, '0')
+    assert.ok(env.GIT_ASKPASS.endsWith('.askpass.sh'), 'GIT_ASKPASS must point at the installed helper')
+    // the helper answers git's credential prompts: username → oauth2, password → $DSH_SYNC_TOKEN
+    const run = (prompt) => new Promise((res, rej) => {
+      execFile('/bin/sh', [env.GIT_ASKPASS, prompt], { env: { ...process.env, DSH_SYNC_TOKEN: 'sekret' } }, (e, o) => e ? rej(e) : res(String(o).trim()))
+    })
+    assert.equal(await run("Username for 'https://gitcode.com': "), 'oauth2')
+    assert.equal(await run("Password for 'https://oauth2@gitcode.com': "), 'sekret')
+    // script content must not embed any literal token
+    const script = await fsp.readFile(env.GIT_ASKPASS, 'utf8')
+    assert.ok(!script.includes('sekret'))
+    assert.ok(script.includes('$DSH_SYNC_TOKEN'))
+  } finally {
+    if (prevHome === undefined) delete process.env.DSH_HOME
+    else process.env.DSH_HOME = prevHome
+    await fsp.rm(dh, { recursive: true, force: true }).catch(() => {})
+  }
 })
 
 test('syncSpec respects the four toggles', () => {
