@@ -1325,7 +1325,8 @@ async function prepareConflictTree(binary, eff, { repoDir, branch }) {
   await gitExec(binary, ['checkout', '-B', branch, tip], repoDir)
   await gitExec(binary, ['fetch', remote, eff.branch], repoDir, authEnv)
   let merged = false
-  try { await gitExec(binary, ['merge', '--no-edit', 'FETCH_HEAD'], repoDir); merged = true } catch { /* conflicts left in the tree */ }
+  // merge 可能创建自动合并提交：身份显式内联，不依赖机器的全局 git 配置
+  try { await gitExec(binary, ['-c', 'user.name=dsh-sync', '-c', 'user.email=dsh-sync@local', 'merge', '--no-edit', 'FETCH_HEAD'], repoDir); merged = true } catch { /* conflicts left in the tree */ }
   const raw = await gitExec(binary, ['diff', '--name-only', '--diff-filter=U'], repoDir).catch(() => '')
   const conflicts = String(raw || '').split(/\r?\n/).map(s => s.trim()).filter(Boolean)
   return { autoMerged: merged && conflicts.length === 0, conflicts }
