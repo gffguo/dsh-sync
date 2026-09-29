@@ -1335,7 +1335,7 @@ async function prepareConflictTree(binary, eff, { repoDir, branch }) {
  *  it, delete the remote sync branch and advance the shadow baseline onto the
  *  canonical branch. Non-GitCode remotes (local test bare repos): push only —
  *  the PR REST surface doesn't exist there. */
-async function finalizeConflictBranch(binary, eff, { repoDir, branch, prNumber, state, logger }) {
+async function finalizeConflictBranch(binary, eff, { repoDir, branch, prNumber, state, logger, pollTries = 5, pollGapMs = 3000 }) {
   const log = (m) => { if (logger && logger.warn) logger.warn(m) }
   const remote = eff.repoUrl, authEnv = gitAuthEnv(eff)
   const unmerged = await gitExec(binary, ['diff', '--name-only', '--diff-filter=U'], repoDir).catch(() => '')
@@ -1347,17 +1347,20 @@ async function finalizeConflictBranch(binary, eff, { repoDir, branch, prNumber, 
   await gitExec(binary, ['push', remote, `HEAD:${branch}`], repoDir, authEnv)
   const parsed = parseRepoUrl(eff.repoUrl)
   if (!parsed) return { merged: true, prSkipped: true }
-  // mergeable 是异步计算的：push 后轮询等它翻转（最多 ~15s）
-  let mergeable = false, stillConflicted = false
-  for (let i = 0; i < 5; i++) {
-    if (i > 0) await new Promise(r => setTimeout(r, 3000))
+  // mergeable 是异步计算的：推送前 PR 一直挂着 mergeable=false，GitCode 在 push 后
+  // 才重算——所以每拍先等再查，false 不一票否决，连续到最后仍 false 才判失败
+  let mergeable = false, lastState
+  for (let i = 0; i < pollTries; i++) {
+    await new Promise(r => setTimeout(r, pollGapMs))
     try {
       const det = await getPullRequest(eff.token, parsed.owner, parsed.repo, prNumber)
-      if (det.ok && det.json && det.json.mergeable === true) { mergeable = true; break }
-      if (det.ok && det.json && det.json.mergeable === false) { stillConflicted = true; break }
+      if (det.ok && det.json) {
+        lastState = det.json.mergeable
+        if (det.json.mergeable === true) { mergeable = true; break }
+      }
     } catch (e) { log(`dsh-sync: PR 轮询失败：${e && e.message}`) }
   }
-  if (!mergeable) return { merged: false, reason: stillConflicted ? 'PR 仍报 mergeable=false（冲突可能未全部解决）' : 'PR mergeable 状态超时未就绪' }
+  if (!mergeable) return { merged: false, reason: lastState === false ? 'PR 仍报 mergeable=false（冲突可能未全部解决）' : 'PR mergeable 状态超时未就绪' }
   const mr = await mergePullRequest(eff.token, parsed.owner, parsed.repo, prNumber, 'squash')
   if (!mr.ok) return { merged: false, reason: `合并 PR 失败（HTTP ${mr.status}）` }
   // 合并即删远端 sync 分支 + 影子基线推进到 main（与 runPush 合并路径一致）

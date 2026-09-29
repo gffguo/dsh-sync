@@ -140,7 +140,7 @@ test('finalizeConflictBranch: resolved branch pushes, PR merges, shadow advances
     await gitNoUser(['add', '-A'], repoDir)
     await gitNoUser(['commit', '--no-edit'], repoDir)
 
-    const r = await I.finalizeConflictBranch('git', eff, { repoDir, branch: 'sync/x/1', prNumber: 7, state })
+    const r = await I.finalizeConflictBranch('git', eff, { repoDir, branch: 'sync/x/1', prNumber: 7, state, pollGapMs: 10 })
     assert.equal(r.merged, true)
     assert.deepEqual(calls.filter(c => c.startsWith('PUT')), ['PUT https://api.gitcode.com/api/v5/repos/o/r/pulls/7/merge'])
     // remote sync branch deleted after merge
@@ -239,7 +239,8 @@ test('finalizeConflictBranch: PR still conflicted → no merge, branch kept', as
     return mk({ message: 'unmocked ' + u }, 404)
   }
   try {
-    const r = await I.finalizeConflictBranch('git', eff, { repoDir, branch: 'sync/x/1', prNumber: 7, state })
+    // mergeable=false 需连续轮询到最后一拍仍是 false 才判失败（推送后 GitCode 异步重算）
+    const r = await I.finalizeConflictBranch('git', eff, { repoDir, branch: 'sync/x/1', prNumber: 7, state, pollTries: 2, pollGapMs: 10 })
     assert.equal(r.merged, false)
     assert.match(r.reason, /mergeable=false/)
     assert.equal(state.lastSyncedCommit, undefined)
