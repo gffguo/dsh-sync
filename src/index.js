@@ -227,14 +227,47 @@ async function atomicWriteFile(file, content) {
   await fsP.rename(temp, file)
 }
 
+// ── MSYS2 path-conversion guard (Git for Windows) ──
+//
+// 症状：Windows 上路径里的「点」被当成路径分隔符——`C:\Users\x\.dsh\dsh-sync\repo`
+// 变成 `C:\Users\x\dsh\dsh-sync\repo`（`.` 消失、多出一级目录），git 因此在不存在的
+// 目录里执行 → fetch failed。手动在正确目录跑 git 却成功。
+//
+// 根因：Git for Windows 的 MSYS2 runtime 在调用原生 .exe 时会重写 argv，按 POSIX 规则
+// 做路径转换（`/`→`\`、`:`→`;`、`.` 按路径段处理）。官方定性为 wontfix：
+//   https://github.com/git-for-windows/git/issues/685
+// 官方绕过开关（https://github.com/git-for-windows/build-extra/issues/376 亦收录）：
+//   MSYS_NO_PATHCONV=1        — Git for Windows 专有
+//   MSYS2_ARG_CONV_EXCL='*'   — 上游 MSYS2 通用（结尾是 L）
+//
+// 两条纪律（都有实证依据）：
+//   1. **只注入给 git 子进程**，绝不写 process.env 全局——全局设置会"wreck havoc"，
+//      Git for Windows 专门开了 warning 提醒（build-extra#376）；ani-cli#715 实测
+//      全局设它会连带弄坏 gVim/nvim 找文件。
+//   2. 变量名必须是 MSYS2_ARG_CONV_EXCL（结尾 L），拼错静默失效。
+//
+// 注意：本插件的 git 调用走 execFile（不启 shell），正常情况压根不经过 MSYS2 runtime，
+// 注入这两个变量对它是无害的 no-op。真正需要它的是**经 bash 的调用**（agent 会话里
+// 模型按提示词执行的 git 命令），以及 future-proof：万一 binary 被换成 shim/wrapper。
+// 见 test/win-pathconv.test.mjs 的契约测试。
+function msysPathConvEnv() {
+  if (process.platform !== 'win32') return undefined
+  return {
+    MSYS_NO_PATHCONV: '1',
+    MSYS2_ARG_CONV_EXCL: '*',
+  }
+}
+
 // ── Git CLI (token stays out of .git/config — authed URL per command) ──
 
 function gitExec(binary, args, cwd, authEnv) {
   return new Promise((fulfil, reject) => {
     const opts = { cwd, timeout: 10 * 60 * 1000, maxBuffer: 16 * 1024 * 1024 }
     // 凭据经 GIT_ASKPASS env 注入（askpass 脚本从 DSH_SYNC_TOKEN 取值）——
-    // argv 不携带 token（ps 全机可见），.git/config 也不落盘
-    if (authEnv) opts.env = { ...process.env, ...authEnv }
+    // argv 不携带 token（ps 全机可见），.git/config 也不落盘。
+    // Windows 额外注入 MSYS2 路径转换开关（见上方 msysPathConvEnv 注释）。
+    const env = { ...process.env, ...(msysPathConvEnv() || {}), ...(authEnv || {}) }
+    opts.env = env
     execFile(binary, args, opts, (error, stdout, stderr) => {
       if (error) {
         const tail = String(stderr || error.message || '').split(/\r?\n/).filter(Boolean).slice(-3).join(' ')
@@ -1276,8 +1309,53 @@ async function applyRemotePullPlan(binary, eff, { repoDir, state, roots }, plan)
 //    the semantic conflict resolution on the prepared working tree, so no
 //    token ever enters the prompt (issue #9). ──
 
+// Windows(Git for Windows)专属注意事项：MSYS2 runtime 会把原生 .exe 的 argv 做
+// POSIX→Windows 路径转换，`.dsh` 这类**目录名里带点**的路径会被当成路径段拆开
+// （`C:\Users\x\.dsh\...` → `C:\Users\x\dsh\...`），git 于是在不存在的目录里执行而
+// 报 fetch failed。官方 wontfix，见 https://github.com/git-for-windows/git/issues/685。
+// 这里让 agent 在 Windows 上给**每条** git 命令临时关掉转换（不写全局环境变量）。
+// 注意：必须定义在 CONFLICT_PROMPT_ZH 之前——这些数组在模块加载期求值，const 在后面
+// 会触发 TDZ ReferenceError（node --check 只查语法，查不出这个）。
+const WINDOWS_PATHCONV_NOTE = [
+  '',
+  '## ⚠️ Windows 专属保险（Git for Windows，必读）',
+  '本机若为 Windows，**先做这一步再动手**，否则你会在一个"看起来对、其实不存在"的目录里操作：',
+  '',
+  '**第 1 步：确认平台。** 执行 `uname -s` 或 `echo $OS`；出现 MINGW/MSYS/CYGWIN 即为 Windows 上的 Git Bash。',
+  '',
+  '**第 2 步：排查路径被破坏。** Git Bash 的 POSIX→Windows 路径转换会把**目录名里的点**当成路径段拆开——',
+  '`C:\\Users\\x\\.dsh\\dsh-sync\\repo` 会变成 `C:\\Users\\x\\dsh\\dsh-sync\\repo`（点消失、多出一级），',
+  'git 于是在不存在的目录里执行并报 `fetch failed`。自检（把下面路径换成实际影子仓库）：',
+  '',
+  '```sh',
+  'printf \'%s\\n\' "<影子仓库路径>"          # 原样打印，看点是否还在',
+  'MSYS_NO_PATHCONV=1 printf \'%s\\n\' "<影子仓库路径>"   # 加开关后再打印，二者应一致',
+  '```',
+  '',
+  '两者**不一致**（或路径里 `.dsh` 变成了 `dsh`）即已中招，必须走第 3 步。',
+  '',
+  '**第 3 步：每条 git 命令前置开关**（只对当前这条命令生效）：',
+  '',
+  '```sh',
+  "MSYS_NO_PATHCONV=1 MSYS2_ARG_CONV_EXCL='*' git -C <影子仓库> show FETCH_HEAD:<路径>",
+  "MSYS_NO_PATHCONV=1 MSYS2_ARG_CONV_EXCL='*' git -C <影子仓库> status",
+  '```',
+  '',
+  '**第 4 步：动手前验证目录真的可达**。用第 3 步的形式执行 `git -C <影子仓库> rev-parse --show-toplevel`，',
+  '输出必须是那个真实存在的影子仓库绝对路径。**若报 `not a git repository` / `No such file or directory`，',
+  '立即停止并如实汇报**，不要在错误目录里继续读写、更不要据此判定"无冲突"或"无需修改"。',
+  '',
+  '硬性纪律：',
+  '- **严禁** `export MSYS_NO_PATHCONV=1` 或写进 `.bashrc` 等全局位置——全局设置会破坏其它程序，',
+  '  且被官方明确警告（Git for Windows build-extra#376）。只允许"每条命令前置"这种局部形式。',
+  '- 变量名必须写全 `MSYS2_ARG_CONV_EXCL`（结尾是 L），拼错会静默失效。',
+  '- 若加了开关仍失败，改用 `git.exe` 显式调用（`node`/`git` 若被 alias 成 winpty 包装会忽略该开关）。',
+  '- 非 Windows 平台：本节全部跳过，不要加任何开关。',
+].join('\n')
+
 const CONFLICT_PROMPT_ZH = [
   '请解决 dsh-sync 同步仓库的冲突：本地工作树已处于合并冲突状态，逐文件分析取舍，解完后提交。',
+  WINDOWS_PATHCONV_NOTE,
   '',
   '## 关键信息',
   '- 本地工作树（影子仓库）：{{shadowDir}}（已 checkout 到分支 {{branch}}，系统已执行 merge 并留下冲突）',
@@ -1381,6 +1459,7 @@ async function finalizeConflictBranch(binary, eff, { repoDir, branch, prNumber, 
 
 const ALIGN_PROMPT_ZH = [
   '请执行 dsh-sync 的「AI 智能对齐」：把本机与远端都改过的文件做语义合并，写入本机对应文件。同步推送由系统在结束后自动完成。',
+  WINDOWS_PATHCONV_NOTE,
   '',
   '## 路径信息',
   '- 影子仓库（git 工作树，只读用于取版本）：{{shadowDir}}',
@@ -1418,6 +1497,7 @@ const ALIGN_PROMPT_ZH = [
 
 const REMOTE_ALIGN_PROMPT_ZH = [
   '请执行 dsh-sync 的「远端对齐」：把用户从其他机器备份中选中的文件与本机当前版本做语义合并，保留两边有效配置，写入本机 live。',
+  WINDOWS_PATHCONV_NOTE,
   '',
   '## 路径信息',
   '- 影子仓库（git 工作树，用于取远端版本）：{{shadowDir}}',
@@ -1611,7 +1691,7 @@ module.exports = {
   name: 'dsh-sync',
   inject: ['webServer', 'settings', 'connection'],
   Config: Config ?? undefined,
-  __internals: { syncSpec, defaultRoots, parseRepoUrl, gitAuthEnv, askpassPath, writeAskpass, ASKPASS_SH, mirrorLiveToShadow, resolveLivePath, copyTree, gitExec, acquireLock, checkRepoPrivate, gitcodeRequest, ensureShadowRepo, runPush, runPull, reconcileRemote, gitCurrentCommit, atomicWriteFile, DEFAULT_SYNC_SETTINGS, CONFLICT_PROMPT_ZH, ALIGN_PROMPT_ZH, REMOTE_ALIGN_PROMPT_ZH, substituteParams, prepareConflictTree, finalizeConflictBranch, strategyForPath, STRATEGY_VALUES, snapshotMirrorSpec, sanitizeSnapshotName, pruneLocalSnapshots, promoteSnapshotToCloud,
+  __internals: { syncSpec, defaultRoots, parseRepoUrl, gitAuthEnv, askpassPath, writeAskpass, ASKPASS_SH, mirrorLiveToShadow, resolveLivePath, copyTree, gitExec, acquireLock, checkRepoPrivate, gitcodeRequest, ensureShadowRepo, runPush, runPull, reconcileRemote, gitCurrentCommit, atomicWriteFile, DEFAULT_SYNC_SETTINGS, CONFLICT_PROMPT_ZH, ALIGN_PROMPT_ZH, REMOTE_ALIGN_PROMPT_ZH, substituteParams, prepareConflictTree, finalizeConflictBranch, strategyForPath, STRATEGY_VALUES, snapshotMirrorSpec, sanitizeSnapshotName, pruneLocalSnapshots, promoteSnapshotToCloud, msysPathConvEnv, expandTilde,
     // remote backup browser（导出供测试）
     BROWSE_REF, logicalSpec, parseRemotePath, categoryForLogical, pullSafety, parseLsTree, fetchBrowseRef, browseRemote, browseRemoteTree, expandToBlobs, planRemotePull, applyRemotePullPlan,
     // apiproxy（导出供测试：mock fetch 驱动 wire 形态回归）

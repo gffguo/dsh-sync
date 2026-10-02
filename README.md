@@ -54,6 +54,23 @@ dsh plugin --profile web add @weibaohui/dsh-sync -w
 5. 日常可点「AI 智能对齐」让 AI 先回填远端新增、语义合并双方改动；出现冲突时设置页会出现「AI 解决冲突」按钮，点一下即可
 6. 需要从其他机器恢复个别文件时，点「浏览远端」→ 在远端目录树中找到文件并勾选 → 「预览拉取」确认安全判定 → 「应用」写入本地（自动拍安全快照）
 
+## Windows 用户注意（路径转换）
+
+在 Windows 的 Git Bash 里，MSYS2 runtime 会对**传给原生 `.exe` 的参数**做 POSIX→Windows 路径转换。
+若路径中某个**目录名带点**（如 `C:\Users\x\.dsh\dsh-sync\repo`），这个点会被当成路径分隔符，
+路径被改写成 `C:\Users\x\dsh\dsh-sync\repo`（点消失、多出一级），git 于是在不存在的目录里执行并报 `fetch failed`。
+
+这是 Git for Windows 的既有行为，官方定性为 wontfix（[git-for-windows#685](https://github.com/git-for-windows/git/issues/685)）。
+本插件自 0.4.2 起做了两层防护：
+
+- **host 侧**：git 子进程在 Windows 下自动注入 `MSYS_NO_PATHCONV=1` 与 `MSYS2_ARG_CONV_EXCL='*'`（仅该子进程，不写全局环境）
+- **AI 侧**：三个 AI 提示词都带 Windows 前置保险——先判定平台，再自检路径是否被改写，每条 git 命令前置开关，
+  并用 `git -C <影子仓库> rev-parse --show-toplevel` 确认目录真实可达后才动手；验证失败即停止汇报
+
+> ⚠️ 请**不要**把 `MSYS_NO_PATHCONV=1` 写进 `.bashrc` 或全局环境——全局设置会影响其它程序，
+> Git for Windows 官方也专门警告过这一点（[build-extra#376](https://github.com/git-for-windows/build-extra/issues/376)）。
+> 只在你自己的终端里按"每条命令前置"的方式临时使用即可。
+
 ## 联系我 :飞书群
 
 ![link](https://foruda.gitee.com/images/1774880015525784725/4fd67005_77493.png "link")
@@ -64,6 +81,7 @@ dsh plugin --profile web add @weibaohui/dsh-sync -w
 
 | 插件版本 | 适配 dsh 版本 | 备注 |
 |---------|--------------|------|
+| 0.4.2 | 0.1.7-rc.2 | 修复 issue #10（Windows）：Git Bash 的 POSIX→Windows 路径转换会把目录名里的**点**拆成路径段（`C:\Users\x\.dsh\...` → `C:\Users\x\dsh\...`），git 于是在不存在的目录里执行而报 `fetch failed`。git 子进程在 win32 下注入 `MSYS_NO_PATHCONV=1` + `MSYS2_ARG_CONV_EXCL='*'`（仅子进程，绝不写全局）；三个 AI 提示词加入 Windows 前置保险（判定平台 → 路径自检 → 每条命令前置开关 → `rev-parse --show-toplevel` 验证目录可达，失败即停）；离线测试 60 项全绿 |
 | 0.4.1 | 0.1.7-rc.2 | 安全修复（issue #9）：AI agent 提示词不再携带 GitCode 访问令牌（prepare/finalize 收归 host 侧）；git 子进程改经 `GIT_ASKPASS` env 注入凭证，argv 不再出现 token；`conflictMode=manual` 现在关闭全部 AI 入口（含手动按钮端点）；离线测试 52 项全绿 |
 | 0.4.0 | 0.1.7-rc.2 | 新增 WebDAV / 本地文件夹备份协议（每协议一页签一开关）、快照多协议通用上云与恢复回退；离线测试 45 项全绿（含伪 WebDAV 服务器 wire 级集成测试） |
 | 0.3.5 | 0.1.7-rc.2 | 新增 `~/agents/skills`（无点目录）技能根，随技能开关与策略一起同步/快照 |
