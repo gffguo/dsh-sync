@@ -51,10 +51,10 @@ dsh plugin --profile web add @weibaohui/dsh-sync -w
 
 ```bash
 npm run check          # 语法检查（src + client）
-npm test               # 离线测试 69 项
+npm test               # 离线测试 72 项
 npm run build:client   # 改了 client/index.js 必须先重建，否则打进去的是旧界面
 npm pack               # → weibaohui-dsh-sync-<version>.tgz
-tar -tzf weibaohui-dsh-sync-0.4.3.tgz   # 应只含 src/、client/、cordis.patch.yml、package.json、README.md
+tar -tzf weibaohui-dsh-sync-0.4.4.tgz   # 应只含 src/、client/、cordis.patch.yml、package.json、README.md
 ```
 
 发布时 `npm publish` 会自动跑 `prepublishOnly`（build:client + check + test），无需手工前置。
@@ -64,7 +64,7 @@ tar -tzf weibaohui-dsh-sync-0.4.3.tgz   # 应只含 src/、client/、cordis.patc
 Desktop 的 profile 名是 `desktop`；**先完全退出 Desktop**（profile 的 `package.json` 有文件锁）：
 
 ```bash
-dsh plugin --profile desktop add file:C:\path\to\weibaohui-dsh-sync-0.4.3.tgz
+dsh plugin --profile desktop add file:C:\path\to\weibaohui-dsh-sync-0.4.4.tgz
 # 或从 npm 装发布版：dsh plugin --profile desktop add @weibaohui/dsh-sync -w
 # 普通 web profile：dsh plugin --profile web add @weibaohui/dsh-sync -w
 ```
@@ -146,6 +146,7 @@ New-Item -ItemType Junction -Path $dst -Target "D:\GfKaifaApplication\dsh-sync"
 
 | 插件版本 | 适配 dsh 版本 | 备注 |
 |---------|--------------|------|
+| 0.4.4 | 0.1.7-rc.2 | 面板/状态层与保存语义：状态轮询失败不再静默（错误行 + 重试）、用户编辑期间不再被轮询覆盖、token「已配置」标记、「清空仓库地址」按钮；PUT 支持 `null` 显式清除（空串 = 保持不变）并回传 `applied`/`ignored`/`cleared`/`persist`；被清除的键写进自持文件墓碑（`cleared`），避免重启后被宿主 config 层复活；`gitAvailable` 加 60s 缓存；离线测试 72 项 |
 | 0.4.3 | 0.1.7-rc.2 | 修复：保存配置后重启 dsh 又回到默认配置。新增自持设置文件 `~/.dsh/dsh-sync/settings.json`（保存即落盘、重启后生效，不依赖宿主 settings 写回）；`Config` 永不 undefined（自铸 Config 兜底，宿主仍可识别）；schemastery 加载加固（拒绝 < 3.18.4 无 `.volatile()` 的副本，失败不再静默）；PUT /settings 响应带 `persist`，宿主写回失败时 UI 提示「已保存到本地」；新增 `GET /dsh-sync/api/diag` 与 `status.persist`；离线测试 69 项（新增 settings-persist 7 项 + 跨重启回归 2 项） |
 | 0.4.2 | 0.1.7-rc.2 | 修复 issue #10（Windows）：Git Bash 的 POSIX→Windows 路径转换会把目录名里的**点**拆成路径段（`C:\Users\x\.dsh\...` → `C:\Users\x\dsh\...`），git 于是在不存在的目录里执行而报 `fetch failed`。git 子进程在 win32 下注入 `MSYS_NO_PATHCONV=1` + `MSYS2_ARG_CONV_EXCL='*'`（仅子进程，绝不写全局）；三个 AI 提示词加入 Windows 前置保险（判定平台 → 路径自检 → 每条命令前置开关 → `rev-parse --show-toplevel` 验证目录可达，失败即停）；离线测试 60 项全绿 |
 | 0.4.1 | 0.1.7-rc.2 | 安全修复（issue #9）：AI agent 提示词不再携带 GitCode 访问令牌（prepare/finalize 收归 host 侧）；git 子进程改经 `GIT_ASKPASS` env 注入凭证，argv 不再出现 token；`conflictMode=manual` 现在关闭全部 AI 入口（含手动按钮端点）；离线测试 52 项全绿 |

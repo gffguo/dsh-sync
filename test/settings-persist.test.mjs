@@ -208,3 +208,12 @@ test('自铸 Config 的 validate 是同步 {value}（cordis resolveConfig 契约
   assert.deepEqual(result.value, { sync: { repoUrl: 'r' } })
   assert.equal(fallback['~standard'].validate(undefined).value instanceof Object, true)
 })
+
+test('parseClearedKeys: 墓碑只接受已知设置键', () => {
+  assert.deepEqual(I.parseClearedKeys(JSON.stringify({ version: 1, sync: {}, cleared: ['repoUrl', 'token', 'nope', 42, null] })), ['repoUrl', 'token'])
+  assert.deepEqual(I.parseClearedKeys(JSON.stringify({ version: 1, sync: {} })), [])
+  assert.deepEqual(I.parseClearedKeys('{ 坏 JSON'), [])
+  assert.deepEqual(I.parseClearedKeys(''), [])
+  // 清除后再保存同键 ⇒ 墓碑必须被撤销（PUT 内 clearedKeys.delete）
+  assert.deepEqual(I.parseClearedKeys(JSON.stringify({ version: 1, sync: { repoUrl: 'r' }, cleared: [] })), [])
+})

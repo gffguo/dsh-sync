@@ -149,6 +149,17 @@ function parseSettingsFile(raw) {
   return out
 }
 
+// 被显式清除（PUT 传 null）的键记进自持文件当"墓碑"：宿主 config 层（cordis.patch.yml
+// 的 config.sync）在"宿主写回失败"的场景里仍留着旧值，只把 doc/file 层删掉的话，
+// 重启后 baseSettings() 会把旧值带回来 —— 清除等于没清。重启后按墓碑把键压回默认值。
+function parseClearedKeys(raw) {
+  try {
+    const parsed = JSON.parse(raw)
+    const list = parsed && Array.isArray(parsed.cleared) ? parsed.cleared : []
+    return list.filter((k) => typeof k === 'string' && Object.prototype.hasOwnProperty.call(DEFAULT_SYNC_SETTINGS, k))
+  } catch { return [] }
+}
+
 // 文件层与宿主文档层的取舍：默认取文件层（这正是「宿主写回失败时保存仍能跨重启生效」
 // 的依据）；但宿主通道若在本文件之后写过（document-updated 事件更晚，或 profile 的
 // cordis.patch.yml mtime 更晚），说明宿主通道确实生效且更新，则让位给宿主文档。
@@ -404,6 +415,18 @@ function gitShowBuf(binary, rev, cwd) {
 
 async function gitAvailable(binary) {
   try { await gitExec(binary, ['--version']); return true } catch { return false }
+}
+
+// /status 每请求 spawn 一次 `git --version`，面板 15s 轮询 + 多标签页时全是进程
+// 开销；git 是否可用在一分钟内不会变，缓存 60s（同步/浏览等真正要用 git 的路径
+// 仍走 gitAvailable 拿实时结果）。
+let gitProbeCache = null
+async function gitAvailableCached(binary, ttlMs = 60000) {
+  const now = Date.now()
+  if (gitProbeCache && gitProbeCache.binary === binary && now - gitProbeCache.at < ttlMs) return gitProbeCache.ok
+  const ok = await gitAvailable(binary)
+  gitProbeCache = { binary, ok, at: Date.now() }
+  return ok
 }
 
 async function gitCurrentCommit(binary, repo) {
@@ -1814,7 +1837,7 @@ module.exports = {
     __setConnection(svc) { connectionSvcRef = svc }, __resetApiproxyCache() { authedUrlCache = null; cookieCache = null },
     syncSettingsSchema, Config, parseLegacySettingsYaml, __seedLegacyYaml,
     // 设置持久化（导出供测试）：自铸 Config + 自持设置文件
-    buildFallbackConfig, parseSettingsFile, pickFileSettingsLayer, Schema,
+    buildFallbackConfig, parseSettingsFile, parseClearedKeys, pickFileSettingsLayer, Schema,
     getSchemaInfo: () => ({ schemaKind, schemasterySource, lastSchemasteryError }) },
 
   apply(ctx, config = {}) {
@@ -1829,11 +1852,14 @@ module.exports = {
     // 落盘：这是「保存后重启回默认」的最终兜底，也是唯一不依赖宿主的持久化路径。
     const settingsFile = join(syncDir, 'settings.json')
     let fileSettings = {}
+    let clearedKeys = new Set() // 显式清除的键（墓碑），见 parseClearedKeys
     let fileSettingsMtime = 0
     let docUpdatedAt = 0
     let lastPersist = { file: settingsFile, fileOk: null, fileError: null, hostOk: null, hostError: null, at: null }
     try {
-      fileSettings = parseSettingsFile(fsSync.readFileSync(settingsFile, 'utf8'))
+      const rawSettings = fsSync.readFileSync(settingsFile, 'utf8')
+      fileSettings = parseSettingsFile(rawSettings)
+      clearedKeys = new Set(parseClearedKeys(rawSettings))
       try { fileSettingsMtime = fsSync.statSync(settingsFile).mtimeMs } catch {}
     } catch (e) {
       if (e && e.code !== 'ENOENT') ctx.logger.warn('dsh-sync: 读取 ' + settingsFile + ' 失败: ' + (e && e.message))
@@ -1841,7 +1867,9 @@ module.exports = {
     async function persistSettingsFile() {
       try {
         await fsP.mkdir(syncDir, { recursive: true })
-        await fsP.writeFile(settingsFile, JSON.stringify({ version: 1, sync: fileSettings }, null, 2) + '\n', { mode: 0o600 })
+        const payload = { version: 1, sync: fileSettings }
+        if (clearedKeys.size > 0) payload.cleared = [...clearedKeys]
+        await fsP.writeFile(settingsFile, JSON.stringify(payload, null, 2) + '\n', { mode: 0o600 })
         try { fileSettingsMtime = fsSync.statSync(settingsFile).mtimeMs } catch {}
         lastPersist = { ...lastPersist, fileOk: true, fileError: null, at: new Date().toISOString() }
         return true
@@ -1908,7 +1936,10 @@ module.exports = {
       const doc = (liveSettings && typeof liveSettings === 'object') ? liveSettings : {}
       const docSync = (doc.sync && typeof doc.sync === 'object') ? doc.sync : {}
       const hostWriteAt = Math.max(docUpdatedAt || 0, hostDocumentMtime())
-      return { ...baseSettings(), ...docSync, ...pickFileSettingsLayer(fileSettings, fileSettingsMtime, hostWriteAt), ...settingsOverrides }
+      const merged = { ...baseSettings(), ...docSync, ...pickFileSettingsLayer(fileSettings, fileSettingsMtime, hostWriteAt), ...settingsOverrides }
+      // 墓碑最后压：被清除的键一律回默认值（否则 baseSettings 里的旧 config 值会复辟）
+      for (const key of clearedKeys) merged[key] = DEFAULT_SYNC_SETTINGS[key]
+      return merged
     }
 
     // 一次性迁移：dsh 0.1.7 把全局 settings.yaml 改名 settings.yaml.imported，
@@ -1962,6 +1993,13 @@ module.exports = {
             docUpdatedAt = Date.now()
             const d = readDescriptor()
             if (d && d.value && typeof d.value === 'object') liveSettings = d.value
+            // 宿主文档又给出某个墓碑键的值 ⇒ 说明用户在别的入口改回来了，墓碑作废
+            const docSync = (liveSettings && liveSettings.sync) || {}
+            let dropped = false
+            for (const key of [...clearedKeys]) {
+              if (docSync[key] !== undefined && docSync[key] !== null) { clearedKeys.delete(key); dropped = true }
+            }
+            if (dropped) persistSettingsFile().catch(() => {})
           })
           return () => { try { off() } catch {} }
         }, 'dsh-sync: settings watch')
@@ -2230,7 +2268,7 @@ module.exports = {
             sendJson(res, 200, {
               repoUrl: eff.repoUrl, branch: eff.branch, dir: displayPath(repoDir), repoExists,
               instanceId: state.instanceId,
-              gitAvailable: await gitAvailable(eff.gitBinary),
+              gitAvailable: await gitAvailableCached(eff.gitBinary),
               lastSyncAt: state.lastSyncAt, lastResult: state.lastResult,
               autoSync: eff.autoSync, syncOnStartup: eff.syncOnStartup,
               intervalMinutes: eff.intervalMinutes, conflictMode: eff.conflictMode,
@@ -2304,42 +2342,55 @@ module.exports = {
             const body = await readJsonBody(req)
             await stateLoaded
             const patch = {}
+            const cleared = []
+            const ignored = []
+            // 收集规则（0.4.4 起区分「写入 / 清除 / 跳过」并回传客户端）：
+            //  非空串=写入；null=显式清除；''=保持原值（旧客户端整表单提交时空串
+            //  不应误清已存值，但记入 ignored，便于 UI 说明"该字段为空"）。
             for (const key of ['repoUrl', 'branch', 'gitBinary', 'conflictMode']) {
               if (typeof body[key] === 'string' && body[key] !== '') patch[key] = body[key]
+              else if (body[key] === null) cleared.push(key)
+              else if (body[key] !== undefined) ignored.push(key)
             }
             for (const key of ['skillsStrategy', 'sessionsStrategy', 'settingsStrategy', 'pluginsStrategy']) {
               if (STRATEGY_VALUES.includes(body[key])) patch[key] = body[key]
+              else if (body[key] !== undefined) ignored.push(key)
             }
             for (const key of ['snapshotSkills', 'snapshotAuto']) {
               if (typeof body[key] === 'boolean') patch[key] = body[key]
+              else if (body[key] !== undefined) ignored.push(key)
             }
             if (typeof body.snapshotLocalKeep === 'number' && body.snapshotLocalKeep >= 1) patch.snapshotLocalKeep = Math.floor(body.snapshotLocalKeep)
+            else if (body.snapshotLocalKeep !== undefined) ignored.push('snapshotLocalKeep')
             for (const key of ['autoSync', 'syncOnStartup', 'syncSkills', 'syncSessions', 'syncSettings', 'syncPlugins', 'gitEnabled', 'webdavEnabled', 'localEnabled']) {
               if (typeof body[key] === 'boolean') patch[key] = body[key]
+              else if (body[key] !== undefined) ignored.push(key)
             }
             if (typeof body.intervalMinutes === 'number' && body.intervalMinutes >= 1) patch.intervalMinutes = body.intervalMinutes
+            else if (body.intervalMinutes !== undefined) ignored.push('intervalMinutes')
             // webdav/local 配置：空串允许（清空地址=停用该协议的一种方式）
             for (const key of ['webdavUrl', 'webdavUsername', 'webdavDir', 'localDir']) {
               if (typeof body[key] === 'string') patch[key] = body[key]
+              else if (body[key] !== undefined) ignored.push(key)
             }
-            // token: non-empty sets; null/'' clears. Never echoed.
-            let clearToken = false
+            // token: 非空=写入；null/''=清除。永不回显。
             if (typeof body.token === 'string' && body.token !== '') patch.token = body.token
-            if (body.token === null || body.token === '') clearToken = true
+            if (body.token === null || body.token === '') cleared.push('token')
             // webdavPassword 同 token 语义：非空才覆盖、null 显式清除（整表单保存
             // 时空串不误清已存密码）
-            let clearWebdavPassword = false
             if (typeof body.webdavPassword === 'string' && body.webdavPassword !== '') patch.webdavPassword = body.webdavPassword
-            if (body.webdavPassword === null) clearWebdavPassword = true
+            if (body.webdavPassword === null) cleared.push('webdavPassword')
             // 私仓硬校验：带 repoUrl+token（首次或换仓库）时拒绝公共仓库
             if (patch.token && (patch.repoUrl || syncSettings().repoUrl)) {
               const checkUrl = patch.repoUrl || syncSettings().repoUrl
               const check = await checkRepoPrivate(patch.token, checkUrl)
               if (!check.ok) { sendJson(res, 400, { error: check.error, isPublic: !!check.isPublic }); return }
             }
-            if (clearToken) { delete settingsOverrides.token; delete fileSettings.token }
-            else Object.assign(settingsOverrides, patch)
-            if (clearWebdavPassword) { delete settingsOverrides.webdavPassword; delete fileSettings.webdavPassword }
+            // 清除语义统一走 cleared：内存 overrides 与自持文件都要删，宿主文档用
+            // mutate(unset)，否则重启后 doc 层会把已清除的值带回来。
+            for (const key of cleared) { delete settingsOverrides[key]; delete fileSettings[key]; clearedKeys.add(key) }
+            Object.assign(settingsOverrides, patch)
+            for (const key of Object.keys(patch)) clearedKeys.delete(key)
             // 持久化①：自持 settings.json（不依赖宿主通道）。面板保存即落盘，
             // 重启后由文件层恢复 —— 宿主写回失败也不丢配置。
             Object.assign(fileSettings, patch)
@@ -2351,8 +2402,9 @@ module.exports = {
             if (ctx.settings && typeof ctx.settings.update === 'function') {
               try {
                 if (Object.keys(patch).length > 0) await ctx.settings.update(SYNC_SETTINGS_NS, { sync: patch })
-                if (clearToken) await ctx.settings.mutate(SYNC_SETTINGS_NS, [{ op: 'unset', path: ['sync', 'token'] }])
-                if (clearWebdavPassword) await ctx.settings.mutate(SYNC_SETTINGS_NS, [{ op: 'unset', path: ['sync', 'webdavPassword'] }])
+                for (const key of cleared) {
+                  if (typeof ctx.settings.mutate === 'function') await ctx.settings.mutate(SYNC_SETTINGS_NS, [{ op: 'unset', path: ['sync', key] }])
+                }
                 hostOk = true
               } catch (e) {
                 hostOk = false
@@ -2366,7 +2418,16 @@ module.exports = {
             if (!fileOk) ctx.logger.warn('dsh-sync: 设置未能落盘（settings.json 写入失败）')
             const eff = syncSettings()
             const { token, webdavPassword: _wdvPw, ...safe } = eff
-            sendJson(res, 200, { settings: safe, hasToken: typeof token === 'string' && token !== '', persist: lastPersist })
+            sendJson(res, 200, {
+              settings: safe,
+              hasToken: typeof token === 'string' && token !== '',
+              persist: lastPersist,
+              // applied=真正写入/清除的键；ignored=收到但被跳过的键（空串/类型不符），
+              // 客户端据此区分"保存成功"和"什么都没保存"。
+              applied: [...new Set([...Object.keys(patch), ...cleared])],
+              cleared: [...new Set(cleared)],
+              ignored: [...new Set(ignored)],
+            })
             return
           }
 

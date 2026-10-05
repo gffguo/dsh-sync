@@ -73,6 +73,11 @@ const ZH = {
   save: '保存',
   saved: '设置已保存',
   savedLocalOnly: '设置已保存到本地（宿主设置写回失败，重启后仍生效）',
+  savedNothing: '没有可保存的修改（空字段已跳过）',
+  statusError: '状态读取失败',
+  retry: '重试',
+  clearRepoUrl: '清空',
+  clearRepoUrlConfirm: '确定清空仓库地址？清空后定时同步会失败，直到重新填写并保存。',
   repoUrlLabel: '仓库地址',
   branchLabel: '分支',
   instanceLabel: '实例 ID',
@@ -201,6 +206,11 @@ const EN = {
   save: 'Save',
   saved: 'Settings saved',
   savedLocalOnly: 'Saved locally (host write-back failed; still applies after restart)',
+  savedNothing: 'Nothing to save (empty fields were skipped)',
+  statusError: 'Status request failed',
+  retry: 'Retry',
+  clearRepoUrl: 'Clear',
+  clearRepoUrlConfirm: 'Clear the repository URL? Scheduled sync will fail until you fill it in again.',
   repoUrlLabel: 'Repository URL',
   branchLabel: 'Branch',
   instanceLabel: 'Instance ID',
@@ -741,13 +751,20 @@ function SettingsSection({ t }) {
   const [testBusy, setTestBusy] = useState(null)
   const [testOut, setTestOut] = useState({})
   const loadedRef = useRef(false)
-
+  const rootRef = useRef(null)
+  // 用户是否动过表单：动过之后 15s 轮询不再回写输入框（保护正在编辑的内容），
+  // 保存成功后清零，下一个轮询周期恢复"服务端值 → 表单"的同步。
+  const dirtyRef = useRef(false)
+  const [statusError, setStatusError] = useState(null)
   const onToast = (text, ms = 3000) => { setToastText(text); setTimeout(() => setToastText(null), ms) }
-  // 首次加载用服务端值填充表单；之后的 15s 轮询只刷新 status，不回写输入框
-  //（避免把用户正在编辑的内容冲掉）
+  // 服务端值回填表单：每次成功轮询都回填，但只在用户没动过表单时（dirtyRef 由
+  // 根节点上的原生 input/change 捕获监听置位）。旧实现只在首次成功时回填，
+  // 首次请求失败就永远是空表单，这正是"面板看着像没保存"的一半原因。
+  // 失败也不再静默：记 statusError 并在顶部给重试入口。
   const refresh = () => getJson(API + '/status').then(d => {
     setStatus(d)
-    if (!loadedRef.current) {
+    setStatusError(null)
+    if (!loadedRef.current || !dirtyRef.current) {
       loadedRef.current = true
       setRepoUrl(d.repoUrl || '')
       setBranch(d.branch || '')
@@ -767,12 +784,25 @@ function SettingsSection({ t }) {
       if (pr.local) { setLocOn(!!pr.local.enabled); setLocDir(pr.local.dir || '') }
     }
     getJson(API + '/snapshot/list').then(l => setSnapList(l)).catch(() => {})
-  }).catch(() => {})
+  }).catch(e => { setStatusError(String((e && e.message) || e)) })
   useEffect(() => {
     refresh()
     const timer = setInterval(refresh, 15000)
     if (typeof timer.unref === 'function') timer.unref()
     return () => clearInterval(timer)
+  }, [])
+  // 用原生监听而不是 React 的 onChangeCapture：面板里任何 input/change 都算
+  // "用户开始编辑"，此后轮询只刷新状态行，不再覆盖表单值。
+  useEffect(() => {
+    const el = rootRef.current
+    if (!el || typeof el.addEventListener !== 'function') return
+    const mark = () => { dirtyRef.current = true }
+    el.addEventListener('input', mark, true)
+    el.addEventListener('change', mark, true)
+    return () => {
+      el.removeEventListener('input', mark, true)
+      el.removeEventListener('change', mark, true)
+    }
   }, [])
 
   const doSync = async () => {
@@ -805,23 +835,45 @@ function SettingsSection({ t }) {
     if (!r.ok) throw new Error(d.error || 'HTTP ' + r.status)
     return d
   }
+  // PUT + 统一成功处理（保存成功后的清空/提示/刷新只在这一次实现）
+  const savePatch = async (patch) => {
+    const res = await putSettings(patch)
+    setToken('')
+    setWdv(prev => ({ ...prev, password: '' }))
+    dirtyRef.current = false
+    const appliedN = res && Array.isArray(res.applied) ? res.applied.length : -1
+    const ignoredN = res && Array.isArray(res.ignored) ? res.ignored.length : 0
+    // 宿主 settings 写回失败时设置只落在插件自持的 settings.json 里：明确告知用户
+    if (res && res.persist && res.persist.hostOk === false) onToast(t('savedLocalOnly'), 5000)
+    // 一个键都没写进去（例如仓库地址还是空的）：不要假装"已保存"
+    else if (appliedN === 0 && ignoredN > 0) onToast(t('savedNothing'), 4200)
+    else onToast(t('saved'), 2200)
+    refresh()
+    return res
+  }
   const doSave = async () => {
+    const patch = {
+      repoUrl, branch, intervalMinutes, autoSync, syncOnStartup, conflictMode,
+      syncSkills: g.skills, syncSessions: g.sessions, syncSettings: g.settings, syncPlugins: g.plugins,
+      skillsStrategy: gs.skills, sessionsStrategy: gs.sessions, settingsStrategy: gs.settings, pluginsStrategy: gs.plugins,
+      snapshotAuto: snapCfg.auto, snapshotSkills: snapCfg.skills, snapshotLocalKeep: snapCfg.localKeep,
+      gitEnabled: gitOn,
+      webdavEnabled: wdvOn, webdavUrl: wdv.url, webdavUsername: wdv.username, webdavDir: wdv.dir,
+      localEnabled: locOn, localDir: locDir,
+    }
+    if (token !== '') patch.token = token
+    if (wdv.password !== '') patch.webdavPassword = wdv.password
     try {
-      const patch = {
-        repoUrl, branch, intervalMinutes, autoSync, syncOnStartup, conflictMode,
-        syncSkills: g.skills, syncSessions: g.sessions, syncSettings: g.settings, syncPlugins: g.plugins,
-        skillsStrategy: gs.skills, sessionsStrategy: gs.sessions, settingsStrategy: gs.settings, pluginsStrategy: gs.plugins,
-        snapshotAuto: snapCfg.auto, snapshotSkills: snapCfg.skills, snapshotLocalKeep: snapCfg.localKeep,
-        gitEnabled: gitOn,
-        webdavEnabled: wdvOn, webdavUrl: wdv.url, webdavUsername: wdv.username, webdavDir: wdv.dir,
-        localEnabled: locOn, localDir: locDir,
-      }
-      if (token !== '') patch.token = token
-      if (wdv.password !== '') patch.webdavPassword = wdv.password
-      const res = await putSettings(patch)
-      setToken('')
-      setWdv(prev => ({ ...prev, password: '' }))
-      // 宿主 settings 写回失败时设置只落在插件自持的 settings.json 里：明确告知用户
+      await savePatch(patch)
+    } catch (e) { onToast((e && e.message) || t('operationFailed'), 4000) }
+  }
+  // 显式清空仓库地址：空串在 0.4.4 语义里是"保持不变"，清空必须发 null
+  const doClearRepoUrl = async () => {
+    try {
+      if (typeof window !== 'undefined' && typeof window.confirm === 'function' && !window.confirm(t('clearRepoUrlConfirm'))) return
+      const res = await putSettings({ repoUrl: null })
+      setRepoUrl('')
+      dirtyRef.current = false
       if (res && res.persist && res.persist.hostOk === false) onToast(t('savedLocalOnly'), 5000)
       else onToast(t('saved'), 2200)
       refresh()
@@ -971,11 +1023,14 @@ function SettingsSection({ t }) {
       gitOn && h('div', { style: { display: 'flex', flexDirection: 'column', gap: 10 } },
         status.gitAvailable === false && h('div', { className: 'sk-tag danger' }, t('gitMissing')),
         row(t('dirLabel'), status.dir),
-        h('input', { className: 'sk-input', value: repoUrl, onChange: e => setRepoUrl(e.target.value), placeholder: t('repoUrlPlaceholder'), style: { width: '100%' } }),
+        h('div', { style: { display: 'flex', gap: 6, alignItems: 'center' } },
+          h('input', { className: 'sk-input', value: repoUrl, onChange: e => setRepoUrl(e.target.value), placeholder: t('repoUrlPlaceholder'), style: { flex: 1 } }),
+          status.repoUrl && h(ButtonLite, { onClick: doClearRepoUrl }, t('clearRepoUrl'))),
         h('input', { className: 'sk-input', value: branch, onChange: e => setBranch(e.target.value), placeholder: t('branchLabel'), style: { width: '100%' } }),
         h('div', { style: { display: 'flex', gap: 6, alignItems: 'center' } },
           h('input', { className: 'sk-input', type: 'password', value: token, onChange: e => setToken(e.target.value),
             placeholder: status.hasToken ? `${t('tokenLabel')} · ${t('tokenConfigured')}` : t('tokenLabel'), style: { flex: 1 } }),
+          status.hasToken && h(Tag, { tone: 'accent' }, t('tokenConfigured')),
           status.hasToken && h(ButtonLite, { onClick: doClearToken }, t('clearToken'))),
         h('div', { className: 'sk-dir' }, t('tokenHint')),
         rec && (recApplied || recBoth) ? h(Tag, { tone: recBoth ? 'danger' : 'accent' }, t('reconcileLine', { applied: recApplied, both: recBoth })) : null,
@@ -1065,7 +1120,10 @@ function SettingsSection({ t }) {
       '\u26A0\uFE0F ' + String((renderErr && renderErr.message) || renderErr))
   }
 
-  return h('div', { className: 'sk-page' },
+  return h('div', { className: 'sk-page', ref: rootRef },
+    statusError && h('div', { className: 'sk-tag danger', style: { marginBottom: 8, display: 'inline-flex', alignItems: 'center', gap: 8 } },
+      t('statusError') + ' · ' + statusError,
+      h(ButtonLite, { small: true, onClick: refresh }, t('retry'))),
     h('div', { className: 'sk-body' }, body),
     conflictOpen && status && status.pendingConflict && h(AgentRunDialog, {
       t, mode: 'conflict', pending: status.pendingConflict, onClose: () => setConflictOpen(false), onToast,

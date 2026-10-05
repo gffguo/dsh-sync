@@ -566,3 +566,40 @@ test('POST protocol/test: local ok, webdav against fake server, unknown kind ref
     assert.equal(unknown.status, 400)
   } finally { await srv.close() }
 })
+
+// 0.4.4 保存语义：'' = 保持不变（旧客户端整表单提交），null = 显式清除；
+// 响应回传 applied/ignored，面板才能区分"保存成功"和"什么都没保存"。
+test('SETTINGS semantics: null clears, empty string keeps, applied/ignored reported', async () => {
+  const h = makeHarness({ repoUrl: 'https://gitcode.com/me/private.git', branch: 'main' })
+  const put1 = await h.call('PUT', '/dsh-sync/api/settings', { repoUrl: '', branch: 'dev', intervalMinutes: 12 })
+  assert.equal(put1.status, 200)
+  assert.equal(h.doc.sync.repoUrl, 'https://gitcode.com/me/private.git', '空串不得清掉已存仓库地址')
+  assert.equal(put1.json.ignored.includes('repoUrl'), true, JSON.stringify(put1.json.ignored))
+  assert.deepEqual([...put1.json.applied].sort(), ['branch', 'intervalMinutes'])
+  // null = 清除：内存 overrides、自持文件、宿主文档三处都要删，否则重启会被 doc 层带回来
+  const put2 = await h.call('PUT', '/dsh-sync/api/settings', { repoUrl: null })
+  assert.equal(put2.status, 200)
+  assert.equal(h.doc.sync.repoUrl, undefined, '宿主文档未清除')
+  assert.equal(put2.json.settings.repoUrl, '', '清除后状态里应为默认空值')
+  assert.ok(put2.json.cleared.includes('repoUrl'))
+  assert.ok(put2.json.applied.includes('repoUrl'))
+  const fileJson = JSON.parse(fs.readFileSync(join(ISO_HOME, 'dsh-sync', 'settings.json'), 'utf8'))
+  assert.equal('repoUrl' in fileJson, false, '自持文件必须同步清除')
+  // 模拟重启「且宿主写回失败」：config 层（cordis.patch.yml 的 config.sync）仍留着旧
+  // repoUrl，墓碑必须把它压回默认值，否则"清除"在重启后复活
+  const reborn = makeHarness({ repoUrl: 'https://gitcode.com/me/private.git' }, { keepSettingsFile: true })
+  const st = await reborn.call('GET', '/dsh-sync/api/status')
+  assert.equal(st.json.repoUrl, '', '重启后应仍是空')
+  // gitAvailable 走 60s 缓存：连续两次 status 都必须是布尔且不抛
+  const st2 = await reborn.call('GET', '/dsh-sync/api/status')
+  assert.equal(typeof st2.json.gitAvailable, 'boolean')
+})
+
+test('SETTINGS semantics: nothing-applied save is reported as such', async () => {
+  const h = makeHarness({})
+  const put = await h.call('PUT', '/dsh-sync/api/settings', { repoUrl: '', branch: '' })
+  assert.equal(put.status, 200)
+  assert.deepEqual(put.json.applied, [], '空表单不应报告写了任何键: ' + JSON.stringify(put.json.applied))
+  assert.ok(put.json.ignored.includes('repoUrl') && put.json.ignored.includes('branch'))
+})
+
