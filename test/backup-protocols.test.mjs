@@ -603,3 +603,50 @@ test('SETTINGS semantics: nothing-applied save is reported as such', async () =>
   assert.ok(put.json.ignored.includes('repoUrl') && put.json.ignored.includes('branch'))
 })
 
+// 0.4.5：托管方支持 —— 已知 provider 自动查私有性，自建/未知主机判不了 ⇒
+// 400 UNVERIFIED_REPO（needConfirm），客户端确认后带 allowUnverifiedRepo 重发。
+test('PUT settings: provider 私有性判定与 UNVERIFIED_REPO 二次确认', async () => {
+  const orig = globalThis.fetch
+  const mk = (obj, status = 200) => ({ ok: status < 400, status, text: async () => JSON.stringify(obj), json: async () => obj })
+  const seen = []
+  globalThis.fetch = async (url, init) => {
+    seen.push(String(url) + ' ' + JSON.stringify((init && init.headers) || {}))
+    if (String(url).includes('api.github.com/repos/me/public-repo')) return mk({ private: false })
+    if (String(url).includes('api.github.com/repos/me/private-repo')) return mk({ private: true, default_branch: 'main' })
+    return mk({ message: 'not found' }, 404)
+  }
+  try {
+    // 公共 GitHub 仓库 → 拒绝，并给出 isPublic 供面板提示
+    const h1 = makeHarness({})
+    const pub = await h1.call('PUT', '/dsh-sync/api/settings', { repoUrl: 'https://github.com/me/public-repo.git', token: 'tok' })
+    assert.equal(pub.status, 400, JSON.stringify(pub.json))
+    assert.equal(pub.json.isPublic, true)
+    // 私有 GitHub 仓库 → 放行，状态里回显 provider
+    const h2 = makeHarness({})
+    const priv = await h2.call('PUT', '/dsh-sync/api/settings', { repoUrl: 'https://github.com/me/private-repo.git', token: 'tok' })
+    assert.equal(priv.status, 200, JSON.stringify(priv.json && priv.json.error))
+    const st2 = await h2.call('GET', '/dsh-sync/api/status')
+    assert.equal(st2.json.provider.kind, 'github')
+    assert.equal(st2.json.provider.unverified, false)
+    // 自建主机：未确认 → 400 UNVERIFIED_REPO；确认后放行
+    const h3 = makeHarness({})
+    const un = await h3.call('PUT', '/dsh-sync/api/settings', { repoUrl: 'https://git.internal.corp/team/repo.git', token: 'tok' })
+    assert.equal(un.status, 400, JSON.stringify(un.json))
+    assert.equal(un.json.code, 'UNVERIFIED_REPO')
+    assert.equal(un.json.needConfirm, true)
+    assert.equal(un.json.host, 'git.internal.corp')
+    assert.ok(/泄露/.test(un.json.error), '文案要说清泄露风险: ' + un.json.error)
+    const ok = await h3.call('PUT', '/dsh-sync/api/settings', { repoUrl: 'https://git.internal.corp/team/repo.git', token: 'tok', allowUnverifiedRepo: true })
+    assert.equal(ok.status, 200, JSON.stringify(ok.json && ok.json.error))
+    assert.equal(ok.json.settings.repoUrl, 'https://git.internal.corp/team/repo.git')
+    const st3 = await h3.call('GET', '/dsh-sync/api/status')
+    assert.equal(st3.json.provider.kind, 'generic')
+    assert.equal(st3.json.provider.unverified, true)
+    assert.equal(st3.json.provider.host, 'git.internal.corp')
+    // GitHub 走 Bearer header，token 不进 URL
+    assert.ok(seen.some(s => s.includes('Bearer')), seen.join(' | '))
+    // seen 条目是 "URL headers"，只看 URL 段（Bearer header 里当然有 tok）
+    assert.ok(!seen.some(s => /github\.com\/repos.*tok/.test(s.split(' ')[0])), 'token 不得出现在 URL 里')
+  } finally { globalThis.fetch = orig }
+})
+

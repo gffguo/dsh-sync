@@ -769,3 +769,18 @@ test('promoteSnapshotToCloud: bare remote gets snapshot tree on pushed branch', 
     await fsp.rm(tmp, { recursive: true, force: true }).catch(() => {})
   }
 })
+
+// 0.4.5：askpass 的用户名要按 provider 走（GitHub HTTPS 不接受任意用户名）。
+// 这里只做纯函数/脚本文本断言——真正执行 sh 的用例在本沙箱里会 spawn EPERM。
+test('askpass username: provider-specific, script keeps the DSH_SYNC_USER hook', () => {
+  assert.equal(I.gitUsernameForProvider('https://github.com/o/r.git'), 'x-access-token')
+  assert.equal(I.gitUsernameForProvider('https://gitcode.com/o/r.git'), 'oauth2')
+  assert.equal(I.gitUsernameForProvider('https://git.internal.corp/o/r.git'), 'oauth2')
+  const env = I.gitAuthEnv({ token: 'sekret', repoUrl: 'https://github.com/o/r.git' })
+  assert.equal(env.DSH_SYNC_USER, 'x-access-token')
+  assert.equal(env.DSH_SYNC_TOKEN, 'sekret')
+  assert.ok(I.ASKPASS_SH.includes('${DSH_SYNC_USER:-oauth2}'), 'askpass 默认用户名必须可被 DSH_SYNC_USER 覆盖')
+  assert.ok(I.ASKPASS_SH.includes('$DSH_SYNC_TOKEN'))
+  assert.ok(!I.ASKPASS_SH.includes('sekret'), '脚本里不得内嵌任何字面 token')
+})
+

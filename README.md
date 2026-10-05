@@ -32,7 +32,7 @@
 - **浏览远端备份**：点「浏览远端」可查看云端仓库的完整目录树，自动识别 `backup/<实例ID>/` 下每台机器的备份并标记本机；在树中勾选文件后「预览拉取」会给出安全判定（哪些可拉、哪些会被阻止及原因），确认后才写入本地——写入前自动拍一份 pre-remote-pull 安全快照
   - 跨机安全提示（不阻止拉取）：另一台机器的 **插件清单**（本地已有时）和 **settings.yaml** 跨机拉取时会⚠警告（覆盖机器专属配置可能导致宿主崩溃），但允许用户自行决定是否拉取；**技能文件**可安全跨机拉取；本机自己的备份无警告（恢复语义）
   - 浏览是只读的：远端 main 拉进独立 ref（`refs/dshsync/browse`），不触碰 FETCH_HEAD，与同步循环无竞争
-- **安全**：强制私有仓库（公共仓库直接拒绝保存）；访问 token 只写不回读
+- **安全（0.4.5 起支持多托管方）**：GitCode（默认）/ GitHub / GitLab / Gitee 四个托管方，保存时按 host 调 REST 判定仓库是否私有，**公共仓库一律拒绝保存**；自建/未知主机的私有性**无法校验**，保存前必须由用户在风险弹窗里显式确认（见「托管方支持与泄露风险」）；访问 token 只写不回读
 - **凭据不出域**：AI agent（冲突处理/智能对齐/远端对齐）的提示词**不含任何访问令牌**——需要凭据的 git 推送、PR 查询/合并全部由插件 host 侧完成，token 不会随提示词发送给模型服务（0.4.1 修复）。git 子进程同样不经 argv 携带 token（argv 可被 `ps` 全机看到），改为 `GIT_ASKPASS` 环境变量注入（0.4.1）；`conflictMode=manual` 时所有 AI 入口（自动触发 + 手动按钮）一律关闭，`ai` 才放行
 - **残余风险提示**：「智能对齐」的本质是把待合并文件的内容交给模型做语义判断——若 `settings.yaml` 等文件内含其他机密（如模型 apiKey），这些值仍会进入模型上下文（这是语义合并功能的固有性质，无法在保留功能的前提下消除）；介意者请把 `conflictMode` 设为 `manual` 或关闭对应同步开关
 - **拉取安全**：pull 只回写本地没动过的远端变更，本地改过的内容不会被覆盖
@@ -51,10 +51,10 @@ dsh plugin --profile web add @weibaohui/dsh-sync -w
 
 ```bash
 npm run check          # 语法检查（src + client）
-npm test               # 离线测试 72 项
+npm test               # 离线测试 78 项
 npm run build:client   # 改了 client/index.js 必须先重建，否则打进去的是旧界面
 npm pack               # → weibaohui-dsh-sync-<version>.tgz
-tar -tzf weibaohui-dsh-sync-0.4.4.tgz   # 应只含 src/、client/、cordis.patch.yml、package.json、README.md
+tar -tzf weibaohui-dsh-sync-0.4.5.tgz   # 应只含 src/、client/、cordis.patch.yml、package.json、README.md
 ```
 
 发布时 `npm publish` 会自动跑 `prepublishOnly`（build:client + check + test），无需手工前置。
@@ -64,7 +64,7 @@ tar -tzf weibaohui-dsh-sync-0.4.4.tgz   # 应只含 src/、client/、cordis.patc
 Desktop 的 profile 名是 `desktop`；**先完全退出 Desktop**（profile 的 `package.json` 有文件锁）：
 
 ```bash
-dsh plugin --profile desktop add file:C:\path\to\weibaohui-dsh-sync-0.4.4.tgz
+dsh plugin --profile desktop add file:C:\path\to\weibaohui-dsh-sync-0.4.5.tgz
 # 或从 npm 装发布版：dsh plugin --profile desktop add @weibaohui/dsh-sync -w
 # 普通 web profile：dsh plugin --profile web add @weibaohui/dsh-sync -w
 ```
@@ -93,8 +93,8 @@ New-Item -ItemType Junction -Path $dst -Target "D:\GfKaifaApplication\dsh-sync"
 
 ## 使用
 
-1. 到 [gitcode.com](https://gitcode.com) 创建一个**私有**仓库（插件不会代建）
-2. 打开 Web UI → **设置页 → dsh-sync**，填入仓库地址与 access token，保存
+1. 到 GitCode（默认）或 GitHub / GitLab / Gitee 创建一个**私有**仓库（插件不会代建）
+2. 打开 Web UI → **设置页 → dsh-sync → Git 页签**，先在「仓库托管方」按钮组点选托管方（默认 GitCode，会自动补上地址前缀并保留已填的 owner/repo），再填仓库地址与 access token，保存
 3. 按需开关四类同步内容
 4. 之后每次修改，通过同步操作把本机变更推成 PR；多机之间即可保持一致
 5. 日常可点「AI 智能对齐」让 AI 先回填远端新增、语义合并双方改动；出现冲突时设置页会出现「AI 解决冲突」按钮，点一下即可
@@ -136,6 +136,17 @@ New-Item -ItemType Junction -Path $dst -Target "D:\GfKaifaApplication\dsh-sync"
 - token / webdavPassword 与宿主文档一致地存放在自持文件里（明文、仅本机、`0600`），**永不回显**；置空保存即清除。
 - 卸载或换机时可安全删除 `~/.dsh/dsh-sync/settings.json`，插件会回到默认值。
 
+## 托管方支持与泄露风险（0.4.5）
+
+- **支持 GitCode（默认）/ GitHub / GitLab / Gitee**：页面「仓库托管方」按钮组切换，切换只改地址前缀、保留已填的 owner/repo。保存时按 host 调对应 REST 判定私有性（GitCode `PRIVATE-TOKEN`、GitHub `Authorization: Bearer`、GitLab `PRIVATE-TOKEN`、Gitee `access_token`），**判定为公共仓库一律拒绝保存**。
+- **自建/未知主机无法校验**：「私仓校验」是防泄露的唯一闸门，而这个闸门只对上面四个托管方有效。填自建/未知 host（如 `https://git.internal.corp/...`）时插件**判不了它是不是私有仓库**，保存会返回 `400 UNVERIFIED_REPO` 并弹出风险确认：
+
+  > 如果是公开仓库，上传后有密钥泄露危险：同步的 settings 组会整文件上传本机 `~/.dsh/settings.yaml`（可能含其它插件的明文密钥）。请确认该仓库是私有仓库、并接受此风险后再继续。
+
+  确认后本次保存才放行（`allowUnverifiedRepo` 标记不落盘，每次保存都要重新确认）。**请务必确认仓库为私有。**
+- **非 GitCode 的功能差异**：PR 创建/合并、「AI 冲突处理」(`conflict/run`)、「清理遗留分支」(`prune-branches`) 目前仍是 GitCode 专属；其他托管方走「只推分支」的降级路径（`prSkipped`），这些入口会返回明确错误而不是静默失败。
+- **登录用户名按托管方**：GitHub 需要 `x-access-token`，其余用 `oauth2`（经 `DSH_SYNC_USER` 传给 askpass 助手；token 依旧只走环境变量、不进 argv）。
+
 ## 联系我 :飞书群
 
 ![link](https://foruda.gitee.com/images/1774880015525784725/4fd67005_77493.png "link")
@@ -146,6 +157,7 @@ New-Item -ItemType Junction -Path $dst -Target "D:\GfKaifaApplication\dsh-sync"
 
 | 插件版本 | 适配 dsh 版本 | 备注 |
 |---------|--------------|------|
+| 0.4.5 | 0.1.7-rc.2 | 新增 GitHub / GitLab / Gitee 托管方（页面按钮组，默认 GitCode）；provider 感知的私仓校验（GitHub/GitLab/Gitee 走各自 REST，自建/未知主机无法校验 → 保存时风险确认 + `UNVERIFIED_REPO`/`allowUnverifiedRepo`）；非 GitCode 时 `prune-branches`/`conflict/run` 给出准确错误；askpass 用户名按 provider（GitHub `x-access-token`）；离线测试 78 项 |
 | 0.4.4 | 0.1.7-rc.2 | 面板/状态层与保存语义：状态轮询失败不再静默（错误行 + 重试）、用户编辑期间不再被轮询覆盖、token「已配置」标记、「清空仓库地址」按钮；PUT 支持 `null` 显式清除（空串 = 保持不变）并回传 `applied`/`ignored`/`cleared`/`persist`；被清除的键写进自持文件墓碑（`cleared`），避免重启后被宿主 config 层复活；`gitAvailable` 加 60s 缓存；离线测试 72 项 |
 | 0.4.3 | 0.1.7-rc.2 | 修复：保存配置后重启 dsh 又回到默认配置。新增自持设置文件 `~/.dsh/dsh-sync/settings.json`（保存即落盘、重启后生效，不依赖宿主 settings 写回）；`Config` 永不 undefined（自铸 Config 兜底，宿主仍可识别）；schemastery 加载加固（拒绝 < 3.18.4 无 `.volatile()` 的副本，失败不再静默）；PUT /settings 响应带 `persist`，宿主写回失败时 UI 提示「已保存到本地」；新增 `GET /dsh-sync/api/diag` 与 `status.persist`；离线测试 69 项（新增 settings-persist 7 项 + 跨重启回归 2 项） |
 | 0.4.2 | 0.1.7-rc.2 | 修复 issue #10（Windows）：Git Bash 的 POSIX→Windows 路径转换会把目录名里的**点**拆成路径段（`C:\Users\x\.dsh\...` → `C:\Users\x\dsh\...`），git 于是在不存在的目录里执行而报 `fetch failed`。git 子进程在 win32 下注入 `MSYS_NO_PATHCONV=1` + `MSYS2_ARG_CONV_EXCL='*'`（仅子进程，绝不写全局）；三个 AI 提示词加入 Windows 前置保险（判定平台 → 路径自检 → 每条命令前置开关 → `rev-parse --show-toplevel` 验证目录可达，失败即停）；离线测试 60 项全绿 |

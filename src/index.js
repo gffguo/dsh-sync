@@ -441,9 +441,10 @@ async function gitCurrentCommit(binary, repo) {
 
 const ASKPASS_SH = [
   '#!/bin/sh',
-  '# dsh-sync askpass: username prompt → oauth2, anything else → the sync token',
+  '# dsh-sync askpass: username prompt → $DSH_SYNC_USER (provider-specific,',
+  '# default oauth2; GitHub wants x-access-token), anything else → the sync token',
   'case "$1" in',
-  '  Username*) echo "oauth2" ;;',
+  '  Username*) echo "${DSH_SYNC_USER:-oauth2}" ;;',
   '  *) echo "$DSH_SYNC_TOKEN" ;;',
   'esac',
 ].join('\n') + '\n'
@@ -463,7 +464,17 @@ async function writeAskpass() {
  *  configured (public/local remotes need no auth). */
 function gitAuthEnv(eff) {
   if (!eff || !eff.token) return undefined
-  return { GIT_ASKPASS: askpassPath(), DSH_SYNC_TOKEN: String(eff.token), GIT_TERMINAL_PROMPT: '0' }
+  return {
+    GIT_ASKPASS: askpassPath(), DSH_SYNC_TOKEN: String(eff.token), GIT_TERMINAL_PROMPT: '0',
+    // GitHub HTTPS 不接受任意用户名（要 x-access-token），GitLab/其它 oauth2 即可
+    DSH_SYNC_USER: gitUsernameForProvider(eff.repoUrl),
+  }
+}
+
+/** HTTPS username for token auth, per provider. */
+function gitUsernameForProvider(repoUrl) {
+  const kind = detectRepoProvider(repoUrl).kind
+  return kind === 'github' ? 'x-access-token' : 'oauth2'
 }
 
 // ── Cross-process lock: tui + web profiles run the same $DSH_HOME, so two
@@ -507,6 +518,107 @@ function parseRepoUrl(url) {
   const m = String(url || '').match(/gitcode\.com\/([^/]+)\/([^/?.]+?)(?:\.git)?(?:[/?#]|$)/i)
   if (!m) return null
   return { owner: m[1], repo: m[2] }
+}
+
+const PROVIDER_LABEL = { gitcode: 'GitCode', github: 'GitHub', gitlab: 'GitLab', gitee: 'Gitee', generic: '自建/未知主机' }
+
+/** Identify the hosting provider from a remote URL. Never throws: anything that
+ *  is not one of the three known hosts is 'generic' (self-hosted / unknown) —
+ *  which is exactly the case where privacy cannot be verified remotely. */
+function detectRepoProvider(url) {
+  const raw = String(url || '').trim()
+  if (!raw) return { kind: 'none', host: '', owner: '', repo: '' }
+  let host = '', pathname = ''
+  try {
+    const u = new URL(/^[a-z][a-z0-9+.-]*:\/\//i.test(raw) ? raw : raw.replace(/^git@([^:]+):/, 'https://$1/'))
+    host = u.hostname.toLowerCase()
+    pathname = u.pathname
+  } catch {
+    const m = raw.match(/^([^/:@]+)[:/](.+)$/)
+    if (!m) return { kind: 'generic', host: '', owner: '', repo: '' }
+    host = String(m[1]).toLowerCase()
+    pathname = '/' + m[2]
+  }
+  const segs = pathname.replace(/^\/+/, '').replace(/\.git$/i, '').split('/').filter(Boolean)
+  const owner = segs.length >= 2 ? segs.slice(0, -1).join('/') : ''
+  const repo = segs.length >= 2 ? segs[segs.length - 1] : (segs[0] || '')
+  let kind = 'generic'
+  if (/(^|\.)gitcode\.(com|net)$/.test(host)) kind = 'gitcode'
+  else if (/(^|\.)github\.com$/.test(host)) kind = 'github'
+  else if (/(^|\.)gitlab\.com$/.test(host)) kind = 'gitlab'
+  else if (/(^|\.)gitee\.com$/.test(host)) kind = 'gitee'
+  return { kind, host, owner, repo }
+}
+
+async function jsonOrNull(r) {
+  try { const t = await r.text(); return t === '' ? null : JSON.parse(t) } catch { return null }
+}
+
+/** Ask a known provider's REST API for repo metadata (private flag + default branch). */
+async function providerRepoInfo(provider, token) {
+  const { kind, owner, repo } = provider
+  if (kind === 'github') {
+    const r = await fetch('https://api.github.com/repos/' + owner + '/' + repo, {
+      headers: { Authorization: 'Bearer ' + token, Accept: 'application/vnd.github+json', 'User-Agent': 'dsh-sync', 'X-GitHub-Api-Version': '2022-11-28' },
+    })
+    const json = await jsonOrNull(r)
+    return { ok: r.ok, status: r.status, privateFlag: json && json.private === true, defaultBranch: json && json.default_branch, json }
+  }
+  if (kind === 'gitee') {
+    const r = await fetch('https://gitee.com/api/v5/repos/' + owner + '/' + repo + '?access_token=' + encodeURIComponent(token))
+    const json = await jsonOrNull(r)
+    return { ok: r.ok, status: r.status, privateFlag: json && (json.private === true || json.public === false), defaultBranch: json && json.default_branch, json }
+  }
+  // gitlab：项目路径要整体 urlencode（支持嵌套 group）
+  const r = await fetch('https://gitlab.com/api/v4/projects/' + encodeURIComponent(owner + '/' + repo), {
+    headers: { 'PRIVATE-TOKEN': token },
+  })
+  const json = await jsonOrNull(r)
+  const vis = json && json.visibility
+  return { ok: r.ok, status: r.status, privateFlag: vis ? vis !== 'public' : (json && json.private === true), defaultBranch: json && json.default_branch, json }
+}
+
+/** Provider-aware "is this repo private?" gate.
+ *
+ *  This gate is the ONLY protection against leaking credentials: the settings
+ *  group mirrors ~/.dsh/settings.yaml wholesale, and other plugins keep plain
+ *  secrets there. GitCode/GitHub/GitLab/Gitee can be asked; a self-hosted or
+ *  unknown host cannot be judged at all, so the caller must make the user
+ *  confirm the risk (needConfirm + code UNVERIFIED_REPO) before we accept it. */
+async function checkRepoAccess(token, repoUrl, { allowUnverified = false } = {}) {
+  const provider = detectRepoProvider(repoUrl)
+  if (!provider.owner || !provider.repo) {
+    return { ok: false, provider, error: '无法解析仓库地址（需要 https://<host>/<owner>/<repo> 这类完整地址）' }
+  }
+  if (provider.kind === 'gitcode') {
+    const r = await checkRepoPrivate(token, repoUrl)
+    return { ...r, provider, verified: true, unverified: false }
+  }
+  if (provider.kind === 'generic') {
+    if (allowUnverified) return { ok: true, provider, verified: false, unverified: true }
+    return {
+      ok: false, provider, verified: false, unverified: true, needConfirm: true, code: 'UNVERIFIED_REPO',
+      error: '无法校验 ' + (provider.host || '该主机') + ' 上的仓库是否为私有（dsh-sync 只识别 GitCode/GitHub/GitLab/Gitee 的私有性）。'
+        + '如果它其实是公开仓库，第一次同步会把本机 settings.yaml（可能含其它插件的明文密钥）推上去，造成密钥泄露。'
+        + '请确认该仓库为私有后再继续。',
+    }
+  }
+  const label = PROVIDER_LABEL[provider.kind]
+  let info
+  try { info = await providerRepoInfo(provider, token) } catch (e) {
+    return { ok: false, provider, verified: true, unverified: false, error: '无法访问 ' + label + ' 仓库：' + String(e && e.message || e) }
+  }
+  if (!info.ok) {
+    return { ok: false, provider, verified: true, unverified: false, error: '无法访问仓库（HTTP ' + info.status + '）：' + ((info.json && (info.json.message || info.json.error)) || '') }
+  }
+  if (info.privateFlag !== true) {
+    return {
+      ok: false, provider, verified: true, unverified: false, isPublic: true,
+      error: '检测到公共仓库（' + label + '：' + provider.owner + '/' + provider.repo + '）。dsh-sync 会同步含凭证的 settings.yaml，'
+        + '必须使用私有仓库——请先把仓库设为私有，再保存。',
+    }
+  }
+  return { ok: true, provider, verified: true, unverified: false, owner: provider.owner, repo: provider.repo, defaultBranch: info.defaultBranch || 'main' }
 }
 
 async function gitcodeRequest(token, method, path, body, { apiBase = GITCODE_API_BASE } = {}) {
@@ -1827,7 +1939,7 @@ module.exports = {
   name: 'dsh-sync',
   inject: ['webServer', 'settings', 'connection'],
   Config: Config ?? undefined,
-  __internals: { syncSpec, defaultRoots, parseRepoUrl, gitAuthEnv, askpassPath, writeAskpass, ASKPASS_SH, mirrorLiveToShadow, resolveLivePath, copyTree, gitExec, acquireLock, checkRepoPrivate, gitcodeRequest, ensureShadowRepo, runPush, runPull, reconcileRemote, gitCurrentCommit, atomicWriteFile, DEFAULT_SYNC_SETTINGS, CONFLICT_PROMPT_ZH, ALIGN_PROMPT_ZH, REMOTE_ALIGN_PROMPT_ZH, substituteParams, prepareConflictTree, finalizeConflictBranch, strategyForPath, STRATEGY_VALUES, snapshotMirrorSpec, sanitizeSnapshotName, pruneLocalSnapshots, promoteSnapshotToCloud, msysPathConvEnv, expandTilde,
+  __internals: { syncSpec, defaultRoots, parseRepoUrl, detectRepoProvider, gitUsernameForProvider, checkRepoAccess, providerRepoInfo, gitAuthEnv, askpassPath, writeAskpass, ASKPASS_SH, mirrorLiveToShadow, resolveLivePath, copyTree, gitExec, acquireLock, checkRepoPrivate, gitcodeRequest, ensureShadowRepo, runPush, runPull, reconcileRemote, gitCurrentCommit, atomicWriteFile, DEFAULT_SYNC_SETTINGS, CONFLICT_PROMPT_ZH, ALIGN_PROMPT_ZH, REMOTE_ALIGN_PROMPT_ZH, substituteParams, prepareConflictTree, finalizeConflictBranch, strategyForPath, STRATEGY_VALUES, snapshotMirrorSpec, sanitizeSnapshotName, pruneLocalSnapshots, promoteSnapshotToCloud, msysPathConvEnv, expandTilde,
     // remote backup browser（导出供测试）
     BROWSE_REF, logicalSpec, parseRemotePath, categoryForLogical, pullSafety, parseLsTree, fetchBrowseRef, browseRemote, browseRemoteTree, expandToBlobs, planRemotePull, applyRemotePullPlan,
     // apiproxy（导出供测试：mock fetch 驱动 wire 形态回归）
@@ -2296,6 +2408,11 @@ module.exports = {
               bothModifiedPending: Object.keys(state.pendingBoth && typeof state.pendingBoth === 'object' ? state.pendingBoth : {}),
               settingsPreserved: !!(state.lastResult && state.lastResult.push && state.lastResult.push.settingsPreserved),
               persist: lastPersist,
+              // 当前仓库的托管方（provider 按钮组的回显 + 自建/未知主机的风险提示）
+              provider: (() => {
+                const p = detectRepoProvider(eff.repoUrl)
+                return { kind: p.kind, host: p.host, owner: p.owner, repo: p.repo, label: PROVIDER_LABEL[p.kind] || PROVIDER_LABEL.generic, unverified: p.kind === 'generic' && !!(p.owner && p.repo) }
+              })(),
               alignRunning: alignState.active,
             })
             return
@@ -2380,11 +2497,21 @@ module.exports = {
             // 时空串不误清已存密码）
             if (typeof body.webdavPassword === 'string' && body.webdavPassword !== '') patch.webdavPassword = body.webdavPassword
             if (body.webdavPassword === null) cleared.push('webdavPassword')
-            // 私仓硬校验：带 repoUrl+token（首次或换仓库）时拒绝公共仓库
-            if (patch.token && (patch.repoUrl || syncSettings().repoUrl)) {
-              const checkUrl = patch.repoUrl || syncSettings().repoUrl
-              const check = await checkRepoPrivate(patch.token, checkUrl)
-              if (!check.ok) { sendJson(res, 400, { error: check.error, isPublic: !!check.isPublic }); return }
+            // 私仓硬校验：首次填/换仓库地址（或换 token）时拒绝公共仓库。GitCode
+            // 之外的主机按 provider 判定；自建/未知主机判不了 ⇒ 先要用户确认风险
+            // （400 UNVERIFIED_REPO），客户端确认后带 allowUnverifiedRepo 重发。
+            const checkUrl = patch.repoUrl || (cleared.includes('repoUrl') ? '' : syncSettings().repoUrl)
+            const checkToken = patch.token || (cleared.includes('token') ? '' : syncSettings().token)
+            if (checkUrl && checkToken && (patch.repoUrl || patch.token)) {
+              const check = await checkRepoAccess(checkToken, checkUrl, { allowUnverified: body.allowUnverifiedRepo === true })
+              if (!check.ok) {
+                sendJson(res, 400, {
+                  error: check.error, isPublic: !!check.isPublic, code: check.code,
+                  needConfirm: !!check.needConfirm, unverified: !!check.unverified,
+                  provider: check.provider && check.provider.kind, host: (check.provider && check.provider.host) || '',
+                })
+                return
+              }
             }
             // 清除语义统一走 cleared：内存 overrides 与自持文件都要删，宿主文档用
             // mutate(unset)，否则重启后 doc 层会把已清除的值带回来。
@@ -2469,8 +2596,11 @@ module.exports = {
               const url = typeof body.repoUrl === 'string' && body.repoUrl ? body.repoUrl : eff.repoUrl
               const token = typeof body.token === 'string' && body.token ? body.token : eff.token
               if (!url || !token) { sendJson(res, 200, { ok: false, error: '缺少仓库地址或访问令牌' }); return }
-              const check = await checkRepoPrivate(token, url)
-              sendJson(res, 200, { ok: !!check.ok, error: check.error })
+              const check = await checkRepoAccess(token, url, { allowUnverified: body.allowUnverifiedRepo === true })
+              sendJson(res, 200, {
+                ok: !!check.ok, error: check.error, code: check.code, needConfirm: !!check.needConfirm,
+                unverified: !!check.unverified, provider: check.provider && check.provider.kind, host: (check.provider && check.provider.host) || '',
+              })
               return
             }
             sendJson(res, 400, { error: '未知协议：' + String(kind) })
@@ -2487,6 +2617,11 @@ module.exports = {
             const eff = syncSettings()
             if (eff.conflictMode !== 'ai') { sendJson(res, 403, { error: 'conflictMode 为 manual，AI 冲突处理已关闭（设置页改为「ai」后可用）' }); return }
             if (!eff.repoUrl || !eff.token) { sendJson(res, 400, { error: '未配置仓库或令牌' }); return }
+            const conflictProvider = detectRepoProvider(eff.repoUrl)
+            if (conflictProvider.kind !== 'gitcode') {
+              sendJson(res, 400, { error: 'AI 冲突处理依赖 PR 流程，目前仅在 GitCode 仓库上可用（当前主机 ' + (conflictProvider.host || '未知') + '）：换用 GitCode 私有仓库，或手动解决分支冲突' })
+              return
+            }
             const body = await readJsonBody(req)
             const branch = body.branch || state.lastPushedBranch
             const prNumber = body.prNumber || state.lastPrNumber
@@ -2596,6 +2731,11 @@ module.exports = {
             await stateLoaded
             const eff = syncSettings()
             if (!eff.repoUrl || !eff.token) { sendJson(res, 400, { error: '未配置仓库或令牌' }); return }
+            const pruneProvider = detectRepoProvider(eff.repoUrl)
+            if (pruneProvider.kind !== 'gitcode') {
+              sendJson(res, 400, { error: '清理遗留分支走的是 GitCode PR 列表接口，目前仅支持 GitCode 仓库（当前主机 ' + (pruneProvider.host || '未知') + '）——请到仓库网页端手动删除 sync/* 分支' })
+              return
+            }
             const parsed = parseRepoUrl(eff.repoUrl)
             if (!parsed) { sendJson(res, 400, { error: '仅支持 GitCode 仓库' }); return }
             const hasShadow = await fsP.access(join(repoDir, '.git')).then(() => true).catch(() => false)
