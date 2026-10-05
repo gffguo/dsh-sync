@@ -412,11 +412,18 @@ test('snapshot promote + fetch roundtrip via webdav and local', async () => {
 
 // ── HTTP API：设置白名单 / 协议测试 / 状态投影 ───────────────────────────
 
-function makeHarness(config = {}) {
+function makeHarness(config = {}, { keepSettingsFile = false } = {}) {
   const routes = []
   // 默认关掉调度器：apply() 会 fire startup auto-sync，与测试自身的 POST /sync
   // 抢同一把锁/同一个 syncRun，在 CI 上制造过 20 分钟的测试间卡死（真机实证）。
   // 需要验证调度行为的用例显式传 autoSync 覆盖。
+  //
+  // 自持 settings.json（0.4.3 起的跨重启持久化层）默认清掉：多数用例只想验证
+  // 「传入的 config → 行为」这一段，不该被同一 DSH_HOME 下前一个用例保存的值
+  // 污染。专门验证持久化的用例传 keepSettingsFile: true。
+  if (!keepSettingsFile) {
+    try { fs.rmSync(join(ISO_HOME, 'dsh-sync', 'settings.json'), { force: true }) } catch {}
+  }
   const doc = { sync: { autoSync: false, syncOnStartup: false, ...JSON.parse(JSON.stringify(config)) } }
   const ctx = {
     logger: { info() {}, warn() {}, error() {} },
@@ -451,7 +458,7 @@ function makeHarness(config = {}) {
     try { json = JSON.parse(res.body) } catch {}
     return { status: res.statusCode, json }
   }
-  return { routes, doc, call }
+  return { routes, doc, call, home: ISO_HOME }
 }
 
 test('PUT settings: protocol fields whitelisted, webdavPassword never echoed', async () => {
@@ -498,6 +505,44 @@ test('status reflects protocol state; sync without any protocol is refused', asy
   const sync2 = await h2.call('POST', '/dsh-sync/api/sync', {})
   assert.equal(sync2.status, 200, JSON.stringify(sync2.json && sync2.json.error))
   assert.equal(sync2.json.backup.webdav.ok, false, 'unreachable webdav recorded as failed backup')
+})
+
+// 回归 m00001「点保存配置 → 重启 dsh 后回到默认」：宿主 settings 写回失败（线上日志
+// No configurable plugin entry "dsh-sync"）时，保存必须靠自持 settings.json 跨重启生效。
+test('保存的设置跨重启保留：自持 settings.json 托住宿主写回失败', async () => {
+  const h = makeHarness({})
+  const put = await h.call('PUT', '/dsh-sync/api/settings', {
+    repoUrl: 'https://gitcode.com/me/private.git', intervalMinutes: 45, autoSync: false, skillsStrategy: 'union',
+  })
+  assert.equal(put.status, 200)
+  assert.equal(put.json.persist.fileOk, true, 'settings.json 未写成功: ' + JSON.stringify(put.json.persist))
+  // 模拟重启 dsh：同一 DSH_HOME、全新 apply，且 config 为空（= 宿主写回失败后的真实状态）
+  const reborn = makeHarness({}, { keepSettingsFile: true })
+  const st = await reborn.call('GET', '/dsh-sync/api/status')
+  assert.equal(st.json.intervalMinutes, 45, '重启后回到默认值 ⟹ 本 bug 未修好')
+  assert.equal(st.json.repoUrl, 'https://gitcode.com/me/private.git')
+  assert.equal(st.json.strategies.skills, 'union', '策略也要跨重启保留')
+  const diag = await reborn.call('GET', '/dsh-sync/api/diag')
+  assert.ok(diag.json.fileSettingsKeys.includes('intervalMinutes'), JSON.stringify(diag.json.fileSettingsKeys))
+  assert.equal(diag.json.schemaKind === 'none', false, 'Config 必须已导出（宿主据此判定可配置）')
+})
+
+test('token/webdavPassword 进自持文件但不回显，null 可清除', async () => {
+  // 干净起点：带上一个已存在的 repoUrl 会让 token 触发私仓硬校验（外网调用）
+  const h = makeHarness({})
+  const put = await h.call('PUT', '/dsh-sync/api/settings', { token: 'ghp_secret', webdavPassword: 'dav_secret' })
+  assert.equal(put.status, 200)
+  assert.equal(put.json.settings.token, undefined, 'token never echoed')
+  assert.equal(put.json.settings.webdavPassword, undefined, 'password never echoed')
+  const raw = fs.readFileSync(join(h.home, 'dsh-sync', 'settings.json'), 'utf8')
+  assert.ok(raw.includes('ghp_secret') && raw.includes('dav_secret'), '凭据必须随其它设置一起跨重启保留')
+  const st = await h.call('GET', '/dsh-sync/api/status')
+  assert.equal(st.json.token, undefined)
+  assert.equal(st.json.webdavPassword, undefined)
+  await h.call('PUT', '/dsh-sync/api/settings', { token: null, webdavPassword: null })
+  const raw2 = fs.readFileSync(join(h.home, 'dsh-sync', 'settings.json'), 'utf8')
+  assert.equal(raw2.includes('ghp_secret'), false, 'null 清除后文件里不应再有旧 token')
+  assert.equal(raw2.includes('dav_secret'), false)
 })
 
 test('POST protocol/test: local ok, webdav against fake server, unknown kind refused', async () => {

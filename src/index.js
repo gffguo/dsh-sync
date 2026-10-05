@@ -37,25 +37,126 @@
 const { execFile } = require('node:child_process')
 const { randomUUID } = require('node:crypto')
 const fsP = require('node:fs/promises')
+const fsSync = require('node:fs')
 const { join, relative, resolve, sep } = require('node:path')
 const { homedir, hostname } = require('node:os')
 const { createWebdavClient } = require('./webdav.js')
 const { localMirrorSwap } = require('./backup.js')
 // settings 服务要求 schemastery schema（可调用 + toJSON；zod 不兼容，register 会抛错被吞）。
-// 宿主沙箱内解析打包依赖可能抛 ERR_INTERNAL_ASSERTION（.pnpm 软链），因此优先沿
-// dsh 全局安装取 settings 服务自用的那份副本，本地开发/测试再退回标准 require。
+// 宿主沙箱内解析打包依赖可能抛 ERR_INTERNAL_ASSERTION（.pnpm 软链），因此按候选次序
+// 找一个真正可用的副本：插件自身依赖 → dsh 全局安装 → 宿主进程里已加载的副本 →
+// 沿本文件向上的 node_modules（profile 提升目录）。每个候选都必须带 .volatile()
+// （schemastery ≥3.18.4）：3.18.1 之类的旧副本会让 Config 变成 undefined，宿主
+// settings 通道于是报 'No configurable plugin entry "dsh-sync"'——面板保存看着成功、
+// 重启后回到默认值。全部候选都不可用时退回自铸 Config（buildFallbackConfig），
+// 保证 Config 永不为 undefined。
+let lastSchemasteryError = ''
+let schemasterySource = ''
+function schemasteryIsUsable(S) {
+  try { return typeof S === 'function' && typeof S.object === 'function' && typeof S.object({}).volatile === 'function' } catch { return false }
+}
 function loadSchemastery() {
   const errors = []
   const { createRequire } = require('node:module')
+  const candidates = []
+  const add = (p) => { if (p && candidates.indexOf(p) === -1) candidates.push(p) }
+  try { add(require.resolve('@deepseek-ai/schemastery')) } catch (e) { errors.push('resolve(self): ' + (e && e.code || e)) }
   for (const prefix of [process.env.DSH_GLOBAL_PREFIX, join(homedir(), '.local')].filter(Boolean)) {
-    const hostCopy = join(prefix, 'lib', 'node_modules', '@deepseek-ai', 'dsh', 'node_modules', '@deepseek-ai', 'schemastery', 'lib', 'index.cjs')
-    try { return createRequire(hostCopy)(hostCopy) } catch (e) { errors.push(String(e && e.code || e)) }
+    add(join(prefix, 'lib', 'node_modules', '@deepseek-ai', 'dsh', 'node_modules', '@deepseek-ai', 'schemastery', 'lib', 'index.cjs'))
+    add(join(prefix, 'node_modules', '@deepseek-ai', 'dsh', 'node_modules', '@deepseek-ai', 'schemastery', 'lib', 'index.cjs'))
   }
-  try { return require('@deepseek-ai/schemastery') } catch (e) { errors.push(String(e && e.code || e)) }
-  if (process.env.DSHSYNC_DEBUG) console.warn(`[dsh-sync] schemastery unavailable: ${errors.join(' | ')}`)
+  for (const cached of Object.keys(require.cache || {})) {
+    if (/[\\/]schemastery[\\/]lib[\\/]index\.(c?js)$/.test(cached)) add(cached)
+  }
+  let dir = __dirname
+  for (let i = 0; i < 8; i++) {
+    add(join(dir, 'node_modules', '@deepseek-ai', 'schemastery', 'lib', 'index.cjs'))
+    const parent = resolve(dir, '..')
+    if (parent === dir) break
+    dir = parent
+  }
+  for (const candidate of candidates) {
+    try {
+      const S = createRequire(candidate)(candidate)
+      if (schemasteryIsUsable(S)) { schemasterySource = candidate; return S }
+      errors.push(candidate + ': 缺少 .volatile()（需 schemastery >= 3.18.4）')
+    } catch (e) { errors.push(candidate + ': ' + (e && e.code || e)) }
+  }
+  try {
+    const S = require('@deepseek-ai/schemastery')
+    if (schemasteryIsUsable(S)) { schemasterySource = 'require:@deepseek-ai/schemastery'; return S }
+    errors.push('require: 缺少 .volatile()')
+  } catch (e) { errors.push('require: ' + (e && e.code || e)) }
+  lastSchemasteryError = errors.join(' | ')
+  console.warn('[dsh-sync] schemastery 不可用，改用自铸 Config（宿主设置写回可能失败，设置仍会持久化到本地文件）: ' + lastSchemasteryError)
   return null
 }
 const Schema = loadSchemastery()
+
+// 自铸 Config：形状与 schemastery 的 toJSON() 等价（{type,meta,dict} 普通嵌套 JSON，
+// 宿主 dsh-settings 的 plainSchema 会 new z(json) 重建），因此即便 schemastery 缺失或
+// 过旧，宿主 settings 仍能识别 dsh-sync 的 volatile 字段（describe 列出 + update 写回）。
+function buildFallbackConfig() {
+  const fieldType = (value) => (typeof value === 'number' ? 'number' : typeof value === 'boolean' ? 'boolean' : 'string')
+  const fields = {}
+  for (const [key, value] of Object.entries(DEFAULT_SYNC_SETTINGS)) fields[key] = { type: fieldType(value), meta: {} }
+  const root = {
+    type: 'object',
+    meta: { default: {} },
+    dict: { sync: { type: 'object', meta: { default: {}, volatile: true }, dict: fields } },
+  }
+  const jsonOf = (desc) => {
+    const out = { type: desc.type, meta: { ...desc.meta } }
+    if (desc.dict) {
+      out.dict = {}
+      for (const [key, child] of Object.entries(desc.dict)) out.dict[key] = jsonOf(child)
+    }
+    return out
+  }
+  // 每个节点都必须自带 toJSON()：宿主 volatileForm() 会在子节点上再次调用
+  // plainSchema(child)（即 child.toJSON()），只给根节点 toJSON 会抛
+  // "schema.toJSON is not a function"。
+  const makeNode = (desc) => {
+    const node = { type: desc.type, meta: { ...desc.meta } }
+    if (desc.dict) {
+      node.dict = {}
+      for (const [key, child] of Object.entries(desc.dict)) node.dict[key] = makeNode(child)
+    }
+    node.toJSON = () => jsonOf(desc)
+    return node
+  }
+  const instance = makeNode(root)
+  instance['~standard'] = {
+    version: 1,
+    vendor: 'dsh-sync-fallback',
+    validate: (input) => ({ value: input === undefined || input === null ? {} : input }),
+  }
+  return instance
+}
+
+// 自持设置文件（<DSH_HOME>/dsh-sync/settings.json）解析：只接受已知字段且类型一致的值。
+function parseSettingsFile(raw) {
+  const out = {}
+  let parsed
+  try { parsed = JSON.parse(raw) } catch { return out }
+  const sync = parsed && typeof parsed === 'object' && parsed.sync && typeof parsed.sync === 'object' ? parsed.sync : null
+  if (!sync) return out
+  for (const key of Object.keys(DEFAULT_SYNC_SETTINGS)) {
+    const v = sync[key]
+    if (v === undefined || v === null) continue
+    if (typeof DEFAULT_SYNC_SETTINGS[key] === typeof v) out[key] = v
+  }
+  return out
+}
+
+// 文件层与宿主文档层的取舍：默认取文件层（这正是「宿主写回失败时保存仍能跨重启生效」
+// 的依据）；但宿主通道若在本文件之后写过（document-updated 事件更晚，或 profile 的
+// cordis.patch.yml mtime 更晚），说明宿主通道确实生效且更新，则让位给宿主文档。
+function pickFileSettingsLayer(fileSettings, fileMtime, hostWriteAt) {
+  if (!fileMtime || !fileSettings || Object.keys(fileSettings).length === 0) return {}
+  if (hostWriteAt && hostWriteAt > fileMtime) return {}
+  return fileSettings
+}
 
 const GITCODE_API_BASE = 'https://api.gitcode.com/api/v5'
 const MAX_BODY_BYTES = 64 * 1024
@@ -143,13 +244,25 @@ function syncSettingsSchema(S) {
 // 降级值必须是 undefined 而非 null：宿主 settings 的 schema() 只排除 undefined，
 // "toJSON" in null 会抛 TypeError 逃出 describe()，拖垮整份设置文档（同 dsh-continue#4）
 let Config
+let schemaKind = 'none'
 try {
   Config = Schema
     ? Schema.object({
       sync: syncSettingsSchema(Schema).volatile(),
     })
-    : undefined
-} catch { /* schemastery <3.18.4 无 .volatile()：降级为无 Config（设置写回不可用），插件运行不受影响 */ }
+    : buildFallbackConfig()
+  schemaKind = Schema ? 'schemastery' : 'fallback'
+} catch (e) {
+  lastSchemasteryError = (lastSchemasteryError ? lastSchemasteryError + ' | ' : '') + 'Config: ' + (e && e.message)
+  Config = buildFallbackConfig()
+  schemaKind = 'fallback'
+  console.warn('[dsh-sync] schemastery Config 构造失败，改用自铸 Config: ' + (e && e.message))
+}
+// 测试/排障钩子：强制走自铸 Config（验证无 schemastery 时宿主 settings 通道仍可用）
+if (process.env.DSHSYNC_FORCE_FALLBACK_SCHEMA) {
+  Config = buildFallbackConfig()
+  schemaKind = 'fallback-forced'
+}
 
 // legacy settings.yaml.imported 读取（dsh 0.1.7 迁移残留；只支持平铺 key: value）
 function legacySettingsPath() {
@@ -1699,7 +1812,10 @@ module.exports = {
     // 多协议备份（导出供测试）
     gitProtocolOn, resolveBackupProtocols, backupLayoutSpec, stageBackupTree, uploadBackupToOne, runBackupUpload, promoteSnapshotToProtocol, fetchSnapshotFromProtocol,
     __setConnection(svc) { connectionSvcRef = svc }, __resetApiproxyCache() { authedUrlCache = null; cookieCache = null },
-    syncSettingsSchema, Config, parseLegacySettingsYaml, __seedLegacyYaml },
+    syncSettingsSchema, Config, parseLegacySettingsYaml, __seedLegacyYaml,
+    // 设置持久化（导出供测试）：自铸 Config + 自持设置文件
+    buildFallbackConfig, parseSettingsFile, pickFileSettingsLayer, Schema,
+    getSchemaInfo: () => ({ schemaKind, schemasterySource, lastSchemasteryError }) },
 
   apply(ctx, config = {}) {
     const dh = dshHome()
@@ -1707,6 +1823,34 @@ module.exports = {
     const repoDir = join(syncDir, 'repo')
     const stateFile = join(syncDir, 'state.json')
     const lockFile = join(syncDir, '.lock')
+
+    // ── 自持设置文件（settings.json）──────────────────────────────────────
+    // 宿主 settings 通道（Config 未被识别 / update 被拒）失败时，面板保存的值仍要
+    // 落盘：这是「保存后重启回默认」的最终兜底，也是唯一不依赖宿主的持久化路径。
+    const settingsFile = join(syncDir, 'settings.json')
+    let fileSettings = {}
+    let fileSettingsMtime = 0
+    let docUpdatedAt = 0
+    let lastPersist = { file: settingsFile, fileOk: null, fileError: null, hostOk: null, hostError: null, at: null }
+    try {
+      fileSettings = parseSettingsFile(fsSync.readFileSync(settingsFile, 'utf8'))
+      try { fileSettingsMtime = fsSync.statSync(settingsFile).mtimeMs } catch {}
+    } catch (e) {
+      if (e && e.code !== 'ENOENT') ctx.logger.warn('dsh-sync: 读取 ' + settingsFile + ' 失败: ' + (e && e.message))
+    }
+    async function persistSettingsFile() {
+      try {
+        await fsP.mkdir(syncDir, { recursive: true })
+        await fsP.writeFile(settingsFile, JSON.stringify({ version: 1, sync: fileSettings }, null, 2) + '\n', { mode: 0o600 })
+        try { fileSettingsMtime = fsSync.statSync(settingsFile).mtimeMs } catch {}
+        lastPersist = { ...lastPersist, fileOk: true, fileError: null, at: new Date().toISOString() }
+        return true
+      } catch (e) {
+        lastPersist = { ...lastPersist, fileOk: false, fileError: String(e && e.message || e), at: new Date().toISOString() }
+        try { ctx.logger.warn('dsh-sync: 写入 ' + settingsFile + ' 失败: ' + (e && e.message)) } catch {}
+        return false
+      }
+    }
 
     // askpass 助手先于任何远端 git 命令落盘（GIT_ASKPASS env 注入的前提）
     writeAskpass().catch(e => ctx.logger.warn(`dsh-sync: askpass 初始化失败: ${e && e.message}`))
@@ -1733,6 +1877,16 @@ module.exports = {
         return ctx.settings.describe().find((x) => x.ns === SYNC_SETTINGS_NS) || null
       } catch { return null }
     }
+    // 宿主设置通道的落盘文件（profile 的 cordis.patch.yml）mtime：宿主写回成功时
+    // 它会被刷新。跑起来之后才出现「文件比自持 settings.json 新」⇒ 宿主通道可用且
+    // 更新，此时以宿主文档为准；否则（写回一直失败，即本 bug）自持文件生效。
+    function hostDocumentMtime() {
+      try {
+        const p = (ctx.settings && ctx.settings.documentPath) || null
+        if (!p) return 0
+        return fsSync.statSync(p).mtimeMs || 0
+      } catch { return 0 }
+    }
     let liveSettings = {} // settings 文档实时值（document-updated 事件驱动刷新）
     // apply 时 loader 可能尚未就绪（describe 投影里还没有本插件条目），间隔重试
     let liveSeen = false
@@ -1747,10 +1901,14 @@ module.exports = {
       if (attempt < 15) setTimeout(() => { refreshLive(attempt + 1) }, 2000).unref?.()
     }
     refreshLive()
+    // 优先级：默认值 < config.sync < 宿主文档 < 自持 settings.json < 本次运行内存覆写。
+    // 自持文件排在宿主文档之上，是为了在「宿主 settings 写回失败」（本 bug）时保存的
+    // 值仍能跨重启生效；一旦宿主通道被证实更新（见 hostDocumentMtime），文件层让位。
     const syncSettings = () => {
       const doc = (liveSettings && typeof liveSettings === 'object') ? liveSettings : {}
       const docSync = (doc.sync && typeof doc.sync === 'object') ? doc.sync : {}
-      return { ...baseSettings(), ...docSync, ...settingsOverrides }
+      const hostWriteAt = Math.max(docUpdatedAt || 0, hostDocumentMtime())
+      return { ...baseSettings(), ...docSync, ...pickFileSettingsLayer(fileSettings, fileSettingsMtime, hostWriteAt), ...settingsOverrides }
     }
 
     // 一次性迁移：dsh 0.1.7 把全局 settings.yaml 改名 settings.yaml.imported，
@@ -1780,6 +1938,9 @@ module.exports = {
         if (ctx.settings && typeof ctx.settings.update === 'function') {
           try {
             await ctx.settings.update(SYNC_SETTINGS_NS, { sync: values })
+            // 迁移结果同样写进自持文件，重启后不依赖宿主通道
+            Object.assign(fileSettings, values)
+            await persistSettingsFile().catch(() => {})
             migrationSettled = true
             refreshLive()
             try { ctx.logger.warn(`dsh-sync: 已从 settings.yaml.imported 迁移同步设置到 profile`) } catch {}
@@ -1797,6 +1958,8 @@ module.exports = {
         ctx.effect(() => {
           const off = ctx.on('settings/document-updated', (ns) => {
             if (ns !== SYNC_SETTINGS_NS) return
+            // 宿主侧写过文档：此后宿主文档优先于自持文件（避免旧文件压掉宿主设置页的修改）
+            docUpdatedAt = Date.now()
             const d = readDescriptor()
             if (d && d.value && typeof d.value === 'object') liveSettings = d.value
           })
@@ -2094,6 +2257,7 @@ module.exports = {
                 ? { branch: state.lastPushedBranch, prNumber: state.lastPrNumber } : null,
               bothModifiedPending: Object.keys(state.pendingBoth && typeof state.pendingBoth === 'object' ? state.pendingBoth : {}),
               settingsPreserved: !!(state.lastResult && state.lastResult.push && state.lastResult.push.settingsPreserved),
+              persist: lastPersist,
               alignRunning: alignState.active,
             })
             return
@@ -2105,6 +2269,33 @@ module.exports = {
               const result = await runSync()
               sendJson(res, 200, result)
             } catch (e) { sendJson(res, 400, { error: String(e && e.message || e) }) }
+            return
+          }
+
+          // GET /dsh-sync/api/diag — 宿主 settings 通道诊断：Config 形态、描述符可见性、
+          // 写回与落盘结果。排障「保存后重启回默认」用，不影响正常流程。
+          if (req.method === 'GET' && apiPath.endsWith('/dsh-sync/api/diag')) {
+            await stateLoaded
+            const diagDescriptor = readDescriptor()
+            let documentPath = null
+            try { documentPath = (ctx.settings && ctx.settings.documentPath) || null } catch {}
+            sendJson(res, 200, {
+              schemaKind,
+              schemasterySource: schemasterySource || null,
+              schemasteryError: lastSchemasteryError || null,
+              configType: typeof Config,
+              configHasToJSON: !!(Config && typeof Config.toJSON === 'function'),
+              settingsNs: SYNC_SETTINGS_NS,
+              descriptorVisible: !!diagDescriptor,
+              descriptorKeys: diagDescriptor && diagDescriptor.value && typeof diagDescriptor.value === 'object' ? Object.keys(diagDescriptor.value) : null,
+              documentPath,
+              documentPathMtime: hostDocumentMtime() || null,
+              lastPersist,
+              settingsFile,
+              fileSettingsKeys: Object.keys(fileSettings),
+              fileSettingsMtime,
+              docUpdatedAt: docUpdatedAt || null,
+            })
             return
           }
 
@@ -2146,20 +2337,36 @@ module.exports = {
               const check = await checkRepoPrivate(patch.token, checkUrl)
               if (!check.ok) { sendJson(res, 400, { error: check.error, isPublic: !!check.isPublic }); return }
             }
-            if (clearToken) delete settingsOverrides.token
+            if (clearToken) { delete settingsOverrides.token; delete fileSettings.token }
             else Object.assign(settingsOverrides, patch)
-            if (clearWebdavPassword) delete settingsOverrides.webdavPassword
-            // 0.1.7 持久化：平铺 patch 挂进 sync: 子对象；token/密码清空走 mutate.unset
+            if (clearWebdavPassword) { delete settingsOverrides.webdavPassword; delete fileSettings.webdavPassword }
+            // 持久化①：自持 settings.json（不依赖宿主通道）。面板保存即落盘，
+            // 重启后由文件层恢复 —— 宿主写回失败也不丢配置。
+            Object.assign(fileSettings, patch)
+            const fileOk = await persistSettingsFile()
+            // 持久化②：宿主 settings 文档（profile patch）。失败只告警，结果通过
+            // persist 字段回给客户端，UI 据此提示「已保存到本地」而不是假装成功。
+            let hostOk = null
+            let hostError = null
             if (ctx.settings && typeof ctx.settings.update === 'function') {
               try {
                 if (Object.keys(patch).length > 0) await ctx.settings.update(SYNC_SETTINGS_NS, { sync: patch })
                 if (clearToken) await ctx.settings.mutate(SYNC_SETTINGS_NS, [{ op: 'unset', path: ['sync', 'token'] }])
                 if (clearWebdavPassword) await ctx.settings.mutate(SYNC_SETTINGS_NS, [{ op: 'unset', path: ['sync', 'webdavPassword'] }])
-              } catch (e) { ctx.logger.warn(`dsh-sync: settings update 失败（仅本次运行生效）: ${e && e.message}`) }
+                hostOk = true
+              } catch (e) {
+                hostOk = false
+                hostError = String(e && e.message || e)
+                ctx.logger.warn('dsh-sync: 宿主 settings 写回失败（设置已持久化到 ' + settingsFile + '，重启后仍生效）: ' + hostError)
+              }
+            } else {
+              hostError = 'settings service unavailable'
             }
+            lastPersist = { ...lastPersist, hostOk, hostError, at: new Date().toISOString() }
+            if (!fileOk) ctx.logger.warn('dsh-sync: 设置未能落盘（settings.json 写入失败）')
             const eff = syncSettings()
             const { token, webdavPassword: _wdvPw, ...safe } = eff
-            sendJson(res, 200, { settings: safe, hasToken: typeof token === 'string' && token !== '' })
+            sendJson(res, 200, { settings: safe, hasToken: typeof token === 'string' && token !== '', persist: lastPersist })
             return
           }
 

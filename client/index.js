@@ -72,6 +72,7 @@ const ZH = {
   syncFailed: '同步失败',
   save: '保存',
   saved: '设置已保存',
+  savedLocalOnly: '设置已保存到本地（宿主设置写回失败，重启后仍生效）',
   repoUrlLabel: '仓库地址',
   branchLabel: '分支',
   instanceLabel: '实例 ID',
@@ -199,6 +200,7 @@ const EN = {
   syncFailed: 'Sync failed',
   save: 'Save',
   saved: 'Settings saved',
+  savedLocalOnly: 'Saved locally (host write-back failed; still applies after restart)',
   repoUrlLabel: 'Repository URL',
   branchLabel: 'Branch',
   instanceLabel: 'Instance ID',
@@ -816,10 +818,12 @@ function SettingsSection({ t }) {
       }
       if (token !== '') patch.token = token
       if (wdv.password !== '') patch.webdavPassword = wdv.password
-      await putSettings(patch)
+      const res = await putSettings(patch)
       setToken('')
       setWdv(prev => ({ ...prev, password: '' }))
-      onToast(t('saved'), 2200)
+      // 宿主 settings 写回失败时设置只落在插件自持的 settings.json 里：明确告知用户
+      if (res && res.persist && res.persist.hostOk === false) onToast(t('savedLocalOnly'), 5000)
+      else onToast(t('saved'), 2200)
       refresh()
     } catch (e) { onToast(e.message || t('operationFailed'), 4000) }
   }
