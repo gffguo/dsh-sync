@@ -997,7 +997,9 @@ async function runPull(binary, eff, { repoDir, state, logger, roots }) {
       const haveShadow = await fsP.access(shadowDir).then(() => true).catch(() => false)
       if (!haveShadow) continue
       if (src.file) {
-        try { await fsP.mkdir(join(src.from, '..'), { recursive: true }); await fsP.copyFile(shadowDir, src.from); applied++ } catch {}
+        const buf = await shadowFileBuf(binary, repoDir, normGitPath(src.to), shadowDir)
+        if (buf === null) continue
+        try { await atomicWriteFile(src.from, buf); applied++ } catch {}
         continue
       }
       // --name-status 输出的是第一参数（旧侧）路径：live 在前，行内路径即 live 文件
@@ -1007,10 +1009,14 @@ async function runPull(binary, eff, { repoDir, state, logger, roots }) {
         // 不归一化则 startsWith(src.from) 恒为 false，整组覆盖会静默空转。
         const livePath = normGitPath(rawPath)
         if (!livePath.startsWith(normGitPath(src.from))) continue
-        const remoteFile = join(shadowDir, relFrom(livePath, src.from))
+        const rel = relFrom(livePath, src.from)
         try {
           if (status === 'A') await fsP.rm(livePath, { recursive: true, force: true })   // 仅本地有 → 按远端为准删除
-          else { await fsP.mkdir(join(livePath, '..'), { recursive: true }); await fsP.copyFile(remoteFile, livePath) }
+          else {
+            const buf = await shadowFileBuf(binary, repoDir, `${normGitPath(src.to)}/${rel}`, join(shadowDir, rel))
+            if (buf === null) continue
+            await atomicWriteFile(livePath, buf)
+          }
           applied++
         } catch {}
       }
@@ -1039,6 +1045,16 @@ function gitDiffNameStatus(a, b, cwd, binary) {
       resolve(entries)
     })
   })
+}
+
+/** 取 shadow 工作树对应提交里的原始字节（工作树文件可能被 autocrlf/eol 改写行尾）；
+ *  取不到（未跟踪内容等）再退回工作树文件，保持旧行为。
+ *  主路径已用 gitShowBuf(rev:path) + atomicWriteFile 写仓库字节，镜像路径必须一致，
+ *  否则 Windows（autocrlf=true）会把远端 LF 写成 CRLF，与其它机器/仓库内容不一致。 */
+async function shadowFileBuf(binary, repoDir, repoRel, worktreeFile) {
+  try { return await gitShowBuf(binary, `HEAD:${repoRel}`, repoDir) } catch {}
+  try { return await fsP.readFile(worktreeFile) } catch {}
+  return null
 }
 
 /** git 输出路径归一化：去掉可能的引号、分隔符统一为 /（Windows 下 git 用 / 拼接目录与文件名）。 */
