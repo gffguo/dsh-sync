@@ -27,6 +27,21 @@ const mkdtemp = async () => {
   const d = await fsp.mkdtemp(join(tmpdir(), 'dshsync-'))
   return d
 }
+// 用 POSIX sh 驱动 askpass 助手：POSIX 上是 /bin/sh；Windows 上是 Git for Windows 自带的
+// usr/bin/sh.exe（在 PATH 里 git.exe 所在目录的上一层兄弟目录），都没有则跳过该用例。
+function findPosixSh() {
+  if (process.platform !== 'win32') return fs.existsSync('/bin/sh') ? '/bin/sh' : null
+  for (const dir of String(process.env.PATH || '').split(';')) {
+    if (!dir || !fs.existsSync(join(dir, 'git.exe'))) continue
+    const root = join(dir, '..')
+    for (const rel of [['usr', 'bin', 'sh.exe'], ['bin', 'sh.exe']]) {
+      const c = join(root, ...rel)
+      if (fs.existsSync(c)) return c
+    }
+  }
+  return null
+}
+const posixSh = findPosixSh()
 
 // ── Pure helpers ────────────────────────────────────────────────────────
 
@@ -37,7 +52,7 @@ test('parseRepoUrl handles gitcode urls', () => {
   assert.equal(I.parseRepoUrl('not a url'), null)
 })
 
-test('git auth travels via GIT_ASKPASS env, never argv (issue #9)', async () => {
+test('git auth travels via GIT_ASKPASS env, never argv (issue #9)', { skip: posixSh ? false : 'POSIX sh 不可用（未安装 Git for Windows 的 usr/bin/sh.exe）' }, async () => {
   // no token configured → no env injection (public/local remotes)
   assert.equal(I.gitAuthEnv({ token: '' }), undefined)
   assert.equal(I.gitAuthEnv(undefined), undefined)
@@ -52,7 +67,7 @@ test('git auth travels via GIT_ASKPASS env, never argv (issue #9)', async () => 
     assert.ok(env.GIT_ASKPASS.endsWith('.askpass.sh'), 'GIT_ASKPASS must point at the installed helper')
     // the helper answers git's credential prompts: username → oauth2, password → $DSH_SYNC_TOKEN
     const run = (prompt) => new Promise((res, rej) => {
-      execFile('/bin/sh', [env.GIT_ASKPASS, prompt], { env: { ...process.env, DSH_SYNC_TOKEN: 'sekret' } }, (e, o) => e ? rej(e) : res(String(o).trim()))
+      execFile(posixSh, [env.GIT_ASKPASS, prompt], { env: { ...process.env, DSH_SYNC_TOKEN: 'sekret' } }, (e, o) => e ? rej(e) : res(String(o).trim()))
     })
     assert.equal(await run("Username for 'https://gitcode.com': "), 'oauth2')
     assert.equal(await run("Password for 'https://oauth2@gitcode.com': "), 'sekret')
