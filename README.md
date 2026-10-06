@@ -3,7 +3,7 @@
 [![DSH plugin](https://img.shields.io/badge/dsh-plugin-green)](https://github.com/topics/dsh-plugin)
 [![npm version](https://img.shields.io/npm/v/@weibaohui/dsh-sync)](https://www.npmjs.com/package/@weibaohui/dsh-sync)
 
-**多机同步插件**：让多台机器上的 dsh 通过一个私有 GitCode 仓库保持一致——技能、会话、设置、插件清单都能同步。除 Git 完整同步外，还支持 **WebDAV** 与 **本地文件夹** 两种纯备份协议，各协议一个页签一个开关。
+**多机同步插件**：让多台机器上的 dsh 通过一个私有 Git 仓库（GitCode / GitHub / GitLab / Gitee / 自建，0.4.5 起）保持一致——技能、会话、设置、插件清单都能同步。除 Git 完整同步外，还支持 **WebDAV** 与 **本地文件夹** 两种纯备份协议，各协议一个页签一个开关。
 
 ![多机同步：仓库配置、同步开关与冲突处理](https://cdn.jsdelivr.net/gh/weibaohui/dsh-sync@main/docs/demo.gif)
 
@@ -147,6 +147,53 @@ New-Item -ItemType Junction -Path $dst -Target "D:\GfKaifaApplication\dsh-sync"
 - **非 GitCode 的功能差异**：PR 创建/合并、「AI 冲突处理」(`conflict/run`)、「清理遗留分支」(`prune-branches`) 目前仍是 GitCode 专属；其他托管方走「只推分支」的降级路径（`prSkipped`），这些入口会返回明确错误而不是静默失败。
 - **登录用户名按托管方**：GitHub 需要 `x-access-token`，其余用 `oauth2`（经 `DSH_SYNC_USER` 传给 askpass 助手；token 依旧只走环境变量、不进 argv）。
 
+## 更新日志（0.4.3 → 0.4.5）
+
+这三个版本围绕同一条问题链：**「点保存 → 提示成功 → 重启 dsh 后设置回到默认」**。0.4.3 修根因，0.4.4 补面板状态层与保存语义，0.4.5 扩展托管方并明确泄露风险闸门。
+
+### 0.4.3 —— 修复「保存后重启又回默认」
+
+**现象**：点「保存」提示成功，重启 dsh 后仓库地址、token、同步开关等又变回默认值。
+
+**根因**：插件导出 `Config` 时拿到的是 `undefined`——可加载到的 `@deepseek-ai/schemastery` 是 3.18.1，没有 3.18.4 才引入的 `.volatile()`。于是宿主 `ctx.settings.describe()` 不再列出 `dsh-sync`；保存走宿主通道时抛 `No configurable plugin entry "dsh-sync"`（日志另见 `Plugin entry "dsh-sync" is no longer configurable`）；该异常被 `catch` 成一行 warn、接口仍返回 200，设置只留在本次运行的内存里，重启即丢。
+
+**改动**：
+
+1. `@deepseek-ai/schemastery` 由 devDependencies 移入 dependencies；
+2. `loadSchemastery()` 逐个候选校验 `typeof S.object({}).volatile === 'function'`，全部不可用才降级，并**始终**打印告警（不再静默失败）；
+3. `Config` 永不为 `undefined`：schemastery 不可用时改用自铸 Config（纯 JSON 结构 + `toJSON()` + `'~standard'.validate`，不依赖 schemastery），宿主仍能识别本插件设置；
+4. 自持持久化层 `~/.dsh/dsh-sync/settings.json`（`0600`，仅本机）：保存即落盘，不依赖宿主写回；重启后的合并优先级为 **内置默认 < 插件 config.sync < 宿主文档 < 自持文件 < 本次运行内存覆写**；
+5. 可观测性：`PUT /dsh-sync/api/settings` 回传 `persist{fileOk,hostOk}`，新增 `GET /dsh-sync/api/diag` 与 `status.persist`；宿主写回失败时 UI 提示「设置已保存到本地（宿主设置写回失败，重启后仍生效）」，不再假装成功。
+
+**验证**：离线测试 69 项（45 通过 + 24 例沙箱内 `spawn EPERM`，与本次改动无关）；真机在 Desktop 的 `desktop` profile 上「保存 → 完全退出 → 重启」，值不再丢失。
+
+### 0.4.4 —— 面板/状态层与保存语义
+
+**问题**：面板看着像「没保存」——首次状态请求失败后表单永远是空的，输入过程中被轮询回写覆盖，token 不回显所以看不出「已配置」。保存语义也含糊：空字符串既可能是「清空」也可能是「没填」。
+
+**改动**：
+
+- 状态轮询失败不再静默：顶部错误行 + 重试入口；轮询成功即回填表单，但仅在用户没动过表单时（`dirtyRef` 由原生 input/change 捕获置位），保护正在编辑的内容；
+- token 输入框显示「已配置」标记（始终不回显明文）；新增「清空仓库地址」按钮（二次确认）；
+- `PUT /dsh-sync/api/settings` 语义固定：`null` = **显式清除**（内存覆写、自持文件、宿主文档三处同删，并写 `clearedKeys` 墓碑层，避免重启后被宿主 config 层复活）；`''` = **保持不变**（兼容旧客户端整表单提交）；响应回传 `applied`/`ignored`/`cleared`/`persist`，一个键都没写时提示「没有可保存的修改（空字段已跳过）」；
+- `status` 增加 `persist` 字段；`gitAvailable` 加 60s 缓存（减少轮询时的 git 探测）；`acquireLock` 容忍首装时的 ENOENT 竞态。
+
+**验证**：离线测试 72 项（48 通过 + 24 例沙箱 `spawn EPERM`）。
+
+### 0.4.5 —— 多托管方与泄露风险闸门
+
+**改动**：
+
+- 设置页 Git 页签新增「仓库托管方」按钮组：**GitCode（默认）/ GitHub / GitLab / Gitee / 其他·自建**；切换只改地址前缀，保留已填的 owner/repo；
+- 保存时按 host 判定仓库是否私有：GitCode（`PRIVATE-TOKEN` + `api.gitcode.com/api/v5`）、GitHub（`Authorization: Bearer` + `api.github.com`）、GitLab（`PRIVATE-TOKEN` + urlencoded project path）、Gitee（`access_token` 查询参数）；**公共仓库一律拒绝保存**（回传 `isPublic`）；
+- **自建/未知主机无法校验私有性**：返回 `400 { code: 'UNVERIFIED_REPO', needConfirm: true, host }`，由风险弹窗让用户显式确认后带 `allowUnverifiedRepo: true` 重发；该标记不落盘，每次保存都要重新确认；
+- 非 GitCode 的能力边界：PR 创建/合并、`conflict/run`（AI 冲突处理）、`prune-branches`（清理遗留分支）仍是 GitCode 专属，其他托管方走「只推分支」降级（`prSkipped`），入口返回明确错误而不是静默失败；
+- askpass 用户名按托管方：GitHub 用 `x-access-token`，其余用 `oauth2`（经 `DSH_SYNC_USER` 传给 askpass 助手；token 依旧只走环境变量、不进 argv）。
+
+**泄露风险（使用者必读）**：见上一节「托管方支持与泄露风险（0.4.5）」——settings 组会把本机 `~/.dsh/settings.yaml` 整文件上传，其中可能含其它插件的明文密钥，因此「仓库是不是私有」是唯一的防泄露闸门；填自建/未知主机时请自行确认仓库为私有。
+
+**验证**：离线测试 78 项（54 通过 + 24 例沙箱 `spawn EPERM`），其中 `test/providers.test.mjs` 4 项覆盖「公共仓库拒绝、私有仓库放行、自建主机二次确认、token 不进 URL」。
+
 ## 联系我 :飞书群
 
 ![link](https://foruda.gitee.com/images/1774880015525784725/4fd67005_77493.png "link")
@@ -154,6 +201,8 @@ New-Item -ItemType Junction -Path $dst -Target "D:\GfKaifaApplication\dsh-sync"
 ## 版本兼容性
 
 本插件与 [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness)（`@deepseek-ai/dsh`）的版本对应关系：
+
+> 0.4.3 / 0.4.4 / 0.4.5 三个版本的详细改动说明见上文「更新日志（0.4.3 → 0.4.5）」。
 
 | 插件版本 | 适配 dsh 版本 | 备注 |
 |---------|--------------|------|
