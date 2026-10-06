@@ -54,7 +54,7 @@ npm run check          # 语法检查（src + client）
 npm test               # 离线测试 78 项
 npm run build:client   # 改了 client/index.js 必须先重建，否则打进去的是旧界面
 npm pack               # → weibaohui-dsh-sync-<version>.tgz
-tar -tzf weibaohui-dsh-sync-0.4.5.tgz   # 应只含 src/、client/、cordis.patch.yml、package.json、README.md
+tar -tzf weibaohui-dsh-sync-0.4.6.tgz   # 应只含 src/、client/、cordis.patch.yml、package.json、README.md
 ```
 
 发布时 `npm publish` 会自动跑 `prepublishOnly`（build:client + check + test），无需手工前置。
@@ -64,7 +64,7 @@ tar -tzf weibaohui-dsh-sync-0.4.5.tgz   # 应只含 src/、client/、cordis.patc
 Desktop 的 profile 名是 `desktop`；**先完全退出 Desktop**（profile 的 `package.json` 有文件锁）：
 
 ```bash
-dsh plugin --profile desktop add file:C:\path\to\weibaohui-dsh-sync-0.4.5.tgz
+dsh plugin --profile desktop add file:C:\path\to\weibaohui-dsh-sync-0.4.6.tgz
 # 或从 npm 装发布版：dsh plugin --profile desktop add @weibaohui/dsh-sync -w
 # 普通 web profile：dsh plugin --profile web add @weibaohui/dsh-sync -w
 ```
@@ -147,9 +147,9 @@ New-Item -ItemType Junction -Path $dst -Target "D:\GfKaifaApplication\dsh-sync"
 - **非 GitCode 的功能差异**：PR 创建/合并、「AI 冲突处理」(`conflict/run`)、「清理遗留分支」(`prune-branches`) 目前仍是 GitCode 专属；其他托管方走「只推分支」的降级路径（`prSkipped`），这些入口会返回明确错误而不是静默失败。
 - **登录用户名按托管方**：GitHub 需要 `x-access-token`，其余用 `oauth2`（经 `DSH_SYNC_USER` 传给 askpass 助手；token 依旧只走环境变量、不进 argv）。
 
-## 更新日志（0.4.3 → 0.4.5）
+## 更新日志（0.4.3 → 0.4.6）
 
-这三个版本围绕同一条问题链：**「点保存 → 提示成功 → 重启 dsh 后设置回到默认」**。0.4.3 修根因，0.4.4 补面板状态层与保存语义，0.4.5 扩展托管方并明确泄露风险闸门。
+0.4.3–0.4.5 围绕同一条问题链：**「点保存 → 提示成功 → 重启 dsh 后设置回到默认」**。0.4.3 修根因，0.4.4 补面板状态层与保存语义，0.4.5 扩展托管方并明确泄露风险闸门；0.4.6 收尾同一批 Windows 环境下暴露的问题（覆盖镜像不生效 + 测试夹具的环境假设）。
 
 ### 0.4.3 —— 修复「保存后重启又回默认」
 
@@ -194,6 +194,24 @@ New-Item -ItemType Junction -Path $dst -Target "D:\GfKaifaApplication\dsh-sync"
 
 **验证**：离线测试 78 项（54 通过 + 24 例沙箱 `spawn EPERM`），其中 `test/providers.test.mjs` 4 项覆盖「公共仓库拒绝、私有仓库放行、自建主机二次确认、token 不进 URL」。
 
+### 0.4.6 —— Windows 覆盖镜像与测试环境
+
+**现象**：Windows 上把技能/会话策略设为「远端为准（只读镜像）」后，本地乱改的文件不会被远端版本冲掉——镜像看着是只读，实际不生效。
+
+**根因**：`runPull` 的覆盖组循环用 `git diff --no-index --name-status` 列出 live 与镜像目录的差异，再用 `m[2].startsWith(src.from)` 过滤出 live 侧路径。Windows 上 git 的默认输出会给含反斜杠的路径**加双引号并转义**（`"D:\\...\\feed/SKILL.md"`，`core.quotePath=false` 也管不住），且目录与文件名之间用 `/` 拼接，于是前缀比较恒为 false，整个覆盖循环静默空转（首次同步还能吃到远端文件，只是因为普通三方 pull 路径写入了 live 上本来不存在的文件）。
+
+**改动**：
+
+- `gitDiffNameStatus` 改用 `git diff --no-index --name-status --no-renames -z`，返回 `[status, path]` 数组（NUL 分隔、不加引号、不转义）；
+- 新增 `normGitPath()`（去引号 + 分隔符统一为 `/`），前缀比较与 `relFrom` 都在归一化路径上做；顺带删掉循环里未使用的 `remoteHave` 探测。
+
+**验证**：进程内 harness 用**真实 git 输出**驱动 `runPull`（stub 掉子进程）：live 的 `SKILL.md` 为「本地乱改」时 `applied=1`，内容被覆盖为远端版本；测试侧修复后 Windows 正常终端 `npm test` 应为 78 项全绿（0.4.5 时的 5 例失败全部是上游 `main` 既有的 Windows 环境问题，已逐条修掉）。
+
+**同一批 Windows 修复（测试侧，不改产品行为）**：`test/multi-instance.test.mjs` 的 remote 覆盖用例 + `test/conflict-ai.test.mjs` 三例 + `test/sync.test.mjs` 的 askpass 用例，此前在 Windows 上必失败（上游 `main` 同样失败，与 0.4.3–0.4.5 无关）：
+
+- `test/conflict-ai.test.mjs`：夹具用 `join(seed,'skills','foo.md').replace('skills/foo.md','foo.md')` 改写路径，Windows 下 `join` 产出反斜杠、replace 不匹配 → 改为直接 `join(seed,'foo.md')`；裸仓库路径同时当 `eff.repoUrl`，而 `parseRepoUrl` 只认 `gitcode.com/<owner>/<repo>`，Windows 反斜杠路径解析为 null 会让 `finalizeConflictBranch` 提前返回 `merged:true` → 传给 `eff.repoUrl` 前把分隔符转成 `/`；
+- `test/sync.test.mjs`：askpass 用例硬编码 `execFile('/bin/sh', ...)`，Windows 上没有 `/bin/sh`（Git for Windows 自带 `usr/bin/sh.exe`）→ 先探测 `/bin/sh` 与 PATH 中 `git.exe` 旁边的 `usr/bin/sh.exe`，都找不到才 skip 该用例。
+
 ## 联系我 :飞书群
 
 ![link](https://foruda.gitee.com/images/1774880015525784725/4fd67005_77493.png "link")
@@ -202,10 +220,11 @@ New-Item -ItemType Junction -Path $dst -Target "D:\GfKaifaApplication\dsh-sync"
 
 本插件与 [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness)（`@deepseek-ai/dsh`）的版本对应关系：
 
-> 0.4.3 / 0.4.4 / 0.4.5 三个版本的详细改动说明见上文「更新日志（0.4.3 → 0.4.5）」。
+> 0.4.3 / 0.4.4 / 0.4.5 / 0.4.6 四个版本的详细改动说明见上文「更新日志（0.4.3 → 0.4.6）」。
 
 | 插件版本 | 适配 dsh 版本 | 备注 |
 |---------|--------------|------|
+| 0.4.6 | 0.1.7-rc.2 | 修复 Windows：远端为准（只读镜像）策略的覆盖循环因 git 路径引号转义 + 分隔符不一致而静默空转（`gitDiffNameStatus` 改 `-z` 解析 + `normGitPath` 归一化比较）；同步修掉 4 例只在 Windows 必失败的上游测试环境假设（conflict-ai 夹具路径、askpass 的 `/bin/sh`）；离线测试 78 项 |
 | 0.4.5 | 0.1.7-rc.2 | 新增 GitHub / GitLab / Gitee 托管方（页面按钮组，默认 GitCode）；provider 感知的私仓校验（GitHub/GitLab/Gitee 走各自 REST，自建/未知主机无法校验 → 保存时风险确认 + `UNVERIFIED_REPO`/`allowUnverifiedRepo`）；非 GitCode 时 `prune-branches`/`conflict/run` 给出准确错误；askpass 用户名按 provider（GitHub `x-access-token`）；离线测试 78 项 |
 | 0.4.4 | 0.1.7-rc.2 | 面板/状态层与保存语义：状态轮询失败不再静默（错误行 + 重试）、用户编辑期间不再被轮询覆盖、token「已配置」标记、「清空仓库地址」按钮；PUT 支持 `null` 显式清除（空串 = 保持不变）并回传 `applied`/`ignored`/`cleared`/`persist`；被清除的键写进自持文件墓碑（`cleared`），避免重启后被宿主 config 层复活；`gitAvailable` 加 60s 缓存；离线测试 72 项 |
 | 0.4.3 | 0.1.7-rc.2 | 修复：保存配置后重启 dsh 又回到默认配置。新增自持设置文件 `~/.dsh/dsh-sync/settings.json`（保存即落盘、重启后生效，不依赖宿主 settings 写回）；`Config` 永不 undefined（自铸 Config 兜底，宿主仍可识别）；schemastery 加载加固（拒绝 < 3.18.4 无 `.volatile()` 的副本，失败不再静默）；PUT /settings 响应带 `persist`，宿主写回失败时 UI 提示「已保存到本地」；新增 `GET /dsh-sync/api/diag` 与 `status.persist`；离线测试 69 项（新增 settings-persist 7 项 + 跨重启回归 2 项） |

@@ -1001,16 +1001,15 @@ async function runPull(binary, eff, { repoDir, state, logger, roots }) {
         continue
       }
       // --name-status 输出的是第一参数（旧侧）路径：live 在前，行内路径即 live 文件
-      const diffOut = await gitDiffNameStatus(src.from, shadowDir, repoDir, binary)
-      for (const line of diffOut.split(/\r?\n/)) {
-        const m = line.match(/^([AMD])\t(.*)$/)
-        if (!m) continue
-        const livePath = m[2]
-        if (!livePath.startsWith(src.from)) continue
+      const diffEntries = await gitDiffNameStatus(src.from, shadowDir, repoDir, binary)
+      for (const [status, rawPath] of diffEntries) {
+        // 路径分隔符归一后再比前缀：Windows 下 git 用 / 拼目录与文件名，
+        // 不归一化则 startsWith(src.from) 恒为 false，整组覆盖会静默空转。
+        const livePath = normGitPath(rawPath)
+        if (!livePath.startsWith(normGitPath(src.from))) continue
         const remoteFile = join(shadowDir, relFrom(livePath, src.from))
-        const remoteHave = await fsP.access(remoteFile).then(() => true).catch(() => false)
         try {
-          if (m[1] === 'A') await fsP.rm(livePath, { recursive: true, force: true })   // 仅本地有 → 按远端为准删除
+          if (status === 'A') await fsP.rm(livePath, { recursive: true, force: true })   // 仅本地有 → 按远端为准删除
           else { await fsP.mkdir(join(livePath, '..'), { recursive: true }); await fsP.copyFile(remoteFile, livePath) }
           applied++
         } catch {}
@@ -1024,12 +1023,27 @@ async function runPull(binary, eff, { repoDir, state, logger, roots }) {
   return { pulled: true, applied, skipped, changed: changed.length }
 }
 
-/** git diff --no-index --name-status：差异时退出码非 0 但 stdout 仍列出差异
- *  （M/D=旧侧有新侧变、A=仅新侧有），需专用 helper 接住非零退出。 */
+/** git diff --no-index --name-status -z：差异时退出码非 0 但 stdout 仍列出差异
+ *  （M/D=旧侧有新侧变、A=仅新侧有），需专用 helper 接住非零退出。
+ *  返回 [status, path] 数组；用 -z 因为 Windows 上路径里的反斜杠会让默认输出给
+ *  路径加引号并转义（core.quotePath=false 也管不住），解析出的路径无法与真实路径比较。 */
 function gitDiffNameStatus(a, b, cwd, binary) {
   return new Promise((resolve) => {
-    execFile(binary, ['diff', '--no-index', '--name-status', '--no-renames', a, b], { cwd, maxBuffer: 16 * 1024 * 1024 }, (error, stdout) => resolve(String(stdout || '')))
+    execFile(binary, ['diff', '--no-index', '--name-status', '--no-renames', '-z', a, b], { cwd, maxBuffer: 16 * 1024 * 1024 }, (error, stdout) => {
+      const parts = String(stdout || '').split('\0')
+      const entries = []
+      for (let i = 0; i + 1 < parts.length; i += 2) {   // 已用 --no-renames：固定 (status, path) 成对
+        const status = parts[i].slice(0, 1)
+        if (status) entries.push([status, parts[i + 1]])
+      }
+      resolve(entries)
+    })
   })
+}
+
+/** git 输出路径归一化：去掉可能的引号、分隔符统一为 /（Windows 下 git 用 / 拼接目录与文件名）。 */
+function normGitPath(p) {
+  return String(p || '').replace(/^"|"$/g, '').split(sep).join('/')
 }
 
 /** 求路径相对基准目录的相对部分（路径分隔符归一为 /）。 */
