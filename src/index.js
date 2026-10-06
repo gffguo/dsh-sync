@@ -877,64 +877,85 @@ async function runPush(binary, eff, { repoDir, instanceId, state, logger, roots,
     await gitExec(binary, ['checkout', 'FETCH_HEAD', '--', p], repoDir).catch(() => {})
   }
 
+  // 未合并/异常返回时把影子仓库 HEAD 与基线拉回远端 main：否则 HEAD 停在 sync 分支上，
+  // 下一轮若 fetch 失败或 reconcile 的 reset 落空，lastSyncedCommit 会被记成分支 tip
+  // （真机实证：基线变成 branch tip 后与远端 main 分叉 → 全库误判 bothModified 挂账）
+  let advancedToMain = false
+  const restoreBaseline = async () => {
+    await gitExec(binary, ['fetch', remote, eff.branch], repoDir, authEnv).catch(() => {})
+    await gitExec(binary, ['checkout', eff.branch], repoDir).catch(() => {})
+    await gitExec(binary, ['reset', '--hard', 'FETCH_HEAD'], repoDir).catch(() => {})
+    state.lastSyncedCommit = (await gitCurrentCommit(binary, repoDir)) || state.lastSyncedCommit
+  }
+
   // 4. commit on a fresh branch
   await gitExec(binary, ['checkout', '-b', branch], repoDir)
   await gitExec(binary, ['add', '-A'], repoDir)
   let commitOk = false
   try { await gitExec(binary, ['-c', 'user.name=dsh-sync', '-c', 'user.email=dsh-sync@local', 'commit', '-m', `sync ${instanceId} ${new Date().toISOString()}`], repoDir); commitOk = true } catch { /* nothing to commit */ }
-  if (!commitOk) return { pushed: false, nothingToCommit: true }
+  if (!commitOk) { await restoreBaseline(); return { pushed: false, nothingToCommit: true } }
 
   // 5. push the branch (token in URL, not in config)
   await gitExec(binary, ['push', remote, `HEAD:${branch}`], repoDir, authEnv)
 
   // 6. create PR + mergeable check
-  const parsed = parseRepoUrl(eff.repoUrl)
-  if (!parsed) {
-    // non-GitCode remote (local test, self-hosted git): push the branch only;
-    // PR create/merge is GitCode-specific and skipped. Advance shadow onto
-    // main as the next cycle's pull baseline.
-    await gitExec(binary, ['fetch', remote, eff.branch], repoDir, authEnv).catch(() => {})
-    await gitExec(binary, ['checkout', eff.branch], repoDir).catch(() => {})
-    await gitExec(binary, ['reset', '--hard', 'FETCH_HEAD'], repoDir).catch(() => {})
-    state.lastSyncedCommit = await gitCurrentCommit(binary, repoDir)
-    state.lastPushedBranch = branch
-    return { pushed: true, prSkipped: true, branch, settingsPreserved }
-  }
-  // 同仓库 PR 的 head 就是分支名（`user:branch` 是 fork PR 语法，GitCode 会 400）
-  const prBody = { head: branch, base: eff.branch, title: `dsh-sync ${instanceId}`, body: `Auto sync from ${instanceId}` }
-  const prRes = await createPullRequest(eff.token, parsed.owner, parsed.repo, prBody)
-  if (!prRes.ok) {
-    // 409 = branch already has an open PR (idempotent retry); try to find it
-    if (prRes.status === 409) return { pushed: true, prConflict: true, message: '已有进行中的同步 PR' }
-    throw new Error(`创建 PR 失败（HTTP ${prRes.status}）：${(prRes.json && prRes.json.message) || prRes.text.slice(0, 160)}`)
-  }
-  const prNumber = prRes.json && (prRes.json.number || prRes.json.id)
-  state.lastPushedBranch = branch
-  state.lastPrNumber = prNumber
-
-  // 7. mergeable?
-  let mergeable = false, conflict = false
+  //    未推进到 main 的每个出口（409、冲突 PR、创建/合并抛错）都要恢复基线：否则 HEAD
+  //    停在 sync 分支上，下一轮 fetch/reset 落空时 lastSyncedCommit 会被记成分支 tip，
+  //    与远端 main 分叉 → 全库误判 bothModified 挂账（真机实证）
   try {
-    const det = await getPullRequest(eff.token, parsed.owner, parsed.repo, prNumber)
-    mergeable = det.ok && det.json && det.json.mergeable === true
-    conflict = det.ok && det.json && det.json.mergeable === false
-  } catch {}
+    const parsed = parseRepoUrl(eff.repoUrl)
+    if (!parsed) {
+      // non-GitCode remote (local test, self-hosted git): push the branch only;
+      // PR create/merge is GitCode-specific and skipped. Advance shadow onto
+      // main as the next cycle's pull baseline.
+      await gitExec(binary, ['fetch', remote, eff.branch], repoDir, authEnv).catch(() => {})
+      await gitExec(binary, ['checkout', eff.branch], repoDir).catch(() => {})
+      await gitExec(binary, ['reset', '--hard', 'FETCH_HEAD'], repoDir).catch(() => {})
+      state.lastSyncedCommit = await gitCurrentCommit(binary, repoDir)
+      state.lastPushedBranch = branch
+      advancedToMain = true
+      return { pushed: true, prSkipped: true, branch, settingsPreserved }
+    }
+    // 同仓库 PR 的 head 就是分支名（`user:branch` 是 fork PR 语法，GitCode 会 400）
+    const prBody = { head: branch, base: eff.branch, title: `dsh-sync ${instanceId}`, body: `Auto sync from ${instanceId}` }
+    const prRes = await createPullRequest(eff.token, parsed.owner, parsed.repo, prBody)
+    if (!prRes.ok) {
+      // 409 = branch already has an open PR (idempotent retry); try to find it
+      if (prRes.status === 409) return { pushed: true, prConflict: true, message: '已有进行中的同步 PR' }
+      throw new Error(`创建 PR 失败（HTTP ${prRes.status}）：${(prRes.json && prRes.json.message) || prRes.text.slice(0, 160)}`)
+    }
+    const prNumber = prRes.json && (prRes.json.number || prRes.json.id)
+    state.lastPushedBranch = branch
+    state.lastPrNumber = prNumber
 
-  if (mergeable) {
-    const mr = await mergePullRequest(eff.token, parsed.owner, parsed.repo, prNumber, 'squash')
-    if (!mr.ok) throw new Error(`合并 PR 失败（HTTP ${mr.status}）`)
-    // 合并即删远端 sync 分支（best effort）：不删的话每次同步遗留一个分支，
-    // 真机仓库实测两天积了 970+ 个 sync/* 分支
-    await gitExec(binary, ['push', remote, '--delete', branch], repoDir, authEnv).catch(() => {})
-    // advance shadow to the merged main
-    await gitExec(binary, ['fetch', remote, eff.branch], repoDir, authEnv).catch(() => {})
-    await gitExec(binary, ['checkout', eff.branch], repoDir).catch(() => {})
-    await gitExec(binary, ['reset', '--hard', 'FETCH_HEAD'], repoDir).catch(() => {})
-    state.lastSyncedCommit = await gitCurrentCommit(binary, repoDir)
-    return { pushed: true, merged: true, prNumber, settingsPreserved }
+    // 7. mergeable?
+    let mergeable = false, conflict = false
+    try {
+      const det = await getPullRequest(eff.token, parsed.owner, parsed.repo, prNumber)
+      mergeable = det.ok && det.json && det.json.mergeable === true
+      conflict = det.ok && det.json && det.json.mergeable === false
+    } catch {}
+
+    if (mergeable) {
+      const mr = await mergePullRequest(eff.token, parsed.owner, parsed.repo, prNumber, 'squash')
+      if (!mr.ok) throw new Error(`合并 PR 失败（HTTP ${mr.status}）`)
+      // 合并即删远端 sync 分支（best effort）：不删的话每次同步遗留一个分支，
+      // 真机仓库实测两天积了 970+ 个 sync/* 分支
+      await gitExec(binary, ['push', remote, '--delete', branch], repoDir, authEnv).catch(() => {})
+      // advance shadow to the merged main
+      await gitExec(binary, ['fetch', remote, eff.branch], repoDir, authEnv).catch(() => {})
+      await gitExec(binary, ['checkout', eff.branch], repoDir).catch(() => {})
+      await gitExec(binary, ['reset', '--hard', 'FETCH_HEAD'], repoDir).catch(() => {})
+      state.lastSyncedCommit = await gitCurrentCommit(binary, repoDir)
+      advancedToMain = true
+      return { pushed: true, merged: true, prNumber, settingsPreserved }
+    }
+    // conflict → leave PR open; client shows the "AI 解决冲突" action button
+    return { pushed: true, prConflict: true, prNumber, conflict: true, settingsPreserved }
+  } finally {
+    // 未推进到 main（409/冲突/抛错）→ 恢复基线，保证下一轮 diff 的基线可达
+    if (!advancedToMain) await restoreBaseline()
   }
-  // conflict → leave PR open; client shows the "AI 解决冲突" action button
-  return { pushed: true, prConflict: true, prNumber, conflict: true, settingsPreserved }
 }
 
 // ── Three-way pull: remote deltas → live, only for untouched files ──
@@ -956,9 +977,13 @@ async function runPull(binary, eff, { repoDir, state, logger, roots }) {
     state.lastSyncedCommit = await gitCurrentCommit(binary, repoDir)
     return { pulled: false, firstBaseline: true }
   }
-  // files remote changed since lastSyncedCommit
+  // 基线守护（0.4.8）：基线被改写/回退后不能直接拿来 diff（同 reconcileRemote）
+  const syncBase = await resolveSyncBase(binary, repoDir, lastSynced, logger)
+  const noCommonBase = syncBase === null
+  const diffBase = syncBase || EMPTY_TREE_HASH
+  // files remote changed since the (corrected) baseline
   let changedRaw = ''
-  try { changedRaw = await gitExec(binary, ['diff', '--name-only', lastSynced, 'FETCH_HEAD'], repoDir) } catch {}
+  try { changedRaw = await gitExec(binary, ['diff', '--name-only', diffBase, 'FETCH_HEAD'], repoDir) } catch {}
   const changed = changedRaw.split(/\r?\n/).map(s => s.trim()).filter(Boolean)
   let applied = 0, skipped = 0
   state.pendingBoth = state.pendingBoth && typeof state.pendingBoth === 'object' ? state.pendingBoth : {}
@@ -969,11 +994,13 @@ async function runPull(binary, eff, { repoDir, state, logger, roots }) {
     try { liveBuf = await fsP.readFile(livePath) } catch {}
     // 机器专属保护：本地已有的插件清单文件绝不被远端覆盖（同 reconcileRemote）
     if ((p === 'plugins' || p.startsWith('plugins/')) && liveBuf !== null) { skipped++; continue }
+    // 无共同基线：无法判断远端是否动过，本机已有文件保持不动（不覆盖、不挂账）
+    if (noCommonBase && liveBuf !== null) { skipped++; continue }
     let remoteBuf = null
     try { remoteBuf = await gitShowBuf(binary, `FETCH_HEAD:${p}`, repoDir) } catch { remoteBuf = null }
     if (remoteBuf === null) { skipped++; delete state.pendingBoth[p]; continue }   // 远端删除不镜像
     if (liveBuf !== null && Buffer.compare(liveBuf, remoteBuf) === 0) { delete state.pendingBoth[p]; continue }
-    const fileBase = state.pendingBoth[p] || lastSynced
+    const fileBase = state.pendingBoth[p] || diffBase
     let baseBuf = null
     try { baseBuf = await gitShowBuf(binary, `${fileBase}:${p}`, repoDir) } catch { baseBuf = Buffer.alloc(0) }
     const untouched = liveBuf === null ? (baseBuf.length === 0) : Buffer.compare(liveBuf, baseBuf) === 0
@@ -1078,6 +1105,57 @@ function relFrom(p, base) {
 //    sides changed are reported as `bothModified` for the AI align step /
 //    conflict PR. Remote deletions are never mirrored into live. ──
 
+const EMPTY_TREE_HASH = '4b825dc642cb6eb9a060e54bf8d69288fbee4904'
+
+// ── 同步基线守护（0.4.8）─────────────────────────────────────────────────
+// reconcile/pull 都用 `git diff lastSyncedCommit FETCH_HEAD` 求「远端改过哪些文件」。
+// 这个 diff 只在 lastSyncedCommit 是 FETCH_HEAD 的祖先时才成立。远端 main 被
+// force-push / 平台合并丢弃旧 tip 后，旧基线还在本地对象库里却不是新 main 的祖先，
+// diff 就退化成「凡内容不同都算远端改过」——本机正在持续写入的文件（会话日志）
+// 被误判 bothModified，推送时被 preserve 回退成远端版本，于是永远推不上去、挂账也
+// 永远销不掉（真机实证 2026-10-06：sessions 停在 20:46，plugins 却每次都推成功）。
+// 处理：基线不可达 → 退化为真正的共同祖先 merge-base；连共同祖先都没有（历史无关）
+// → 返回 null，调用方按「无共同基线」处理（只回填本机没有的文件，不覆盖、不挂账）。
+async function resolveSyncBase(binary, repoDir, lastSynced, logger) {
+  if (!lastSynced) return null
+  const isAncestor = await gitExec(binary, ['merge-base', '--is-ancestor', lastSynced, 'FETCH_HEAD'], repoDir)
+    .then(() => true).catch(() => false)
+  if (isAncestor) return lastSynced
+  const mb = (await gitExec(binary, ['merge-base', lastSynced, 'FETCH_HEAD'], repoDir).catch(() => '')).trim()
+  if (logger) {
+    logger.warn('dsh-sync: 同步基线 ' + String(lastSynced).slice(0, 8) +
+      ' 已不是远端 tip 的祖先（远端 main 被改写或回退？），改用共同祖先 ' + (mb ? mb.slice(0, 8) : '（无）'))
+  }
+  return mb || null
+}
+
+// 逐文件挂账基线复核：pendingBoth[p] 记的是「发现双方改动时」的共同基线。基线被改写后
+// 这个记账值同样失效，「远端改过该文件」的前提随之作废 → 用真共同祖先重新判定：修正后
+// 的基线里没动过该文件就销账（本机版本可以正常推送），真动过就把记账基线修正到共同
+// 祖先，冲突判定继续保留（保守：只在基线已不可达时才动记账值）。
+async function revalidatePendingBoth(binary, repoDir, state, logger) {
+  const cleared = []
+  const pending = state.pendingBoth && typeof state.pendingBoth === 'object' ? state.pendingBoth : {}
+  for (const p of Object.keys(pending)) {
+    const recBase = pending[p]
+    if (!recBase) continue
+    const alive = await gitExec(binary, ['merge-base', '--is-ancestor', recBase, 'FETCH_HEAD'], repoDir)
+      .then(() => true).catch(() => false)
+    if (alive) continue
+    const mb = (await gitExec(binary, ['merge-base', recBase, 'FETCH_HEAD'], repoDir).catch(() => '')).trim()
+    if (!mb) { delete pending[p]; cleared.push(p); continue }
+    const touched = await gitExec(binary, ['diff', '--name-only', mb, 'FETCH_HEAD', '--', p], repoDir)
+      .then((s) => s.trim().length > 0).catch(() => true)
+    if (!touched) { delete pending[p]; cleared.push(p); continue }
+    pending[p] = mb
+  }
+  if (cleared.length && logger) {
+    logger.warn('dsh-sync: 挂账基线失效，已自动销账 ' + cleared.length + ' 个文件（远端其实没改过它们）' +
+      (cleared.length <= 3 ? '：' + cleared.join('、') : ''))
+  }
+  return { cleared }
+}
+
 async function reconcileRemote(binary, eff, { repoDir, state, logger, roots }) {
   const fs = require('node:fs')
   try { await fs.promises.access(join(repoDir, '.git')) } catch { return { reconciled: false, noShadow: true } }
@@ -1091,18 +1169,27 @@ async function reconcileRemote(binary, eff, { repoDir, state, logger, roots }) {
   if (!hasFetch) return { reconciled: false, empty: true }
   // 首次同步基线 = 空树：云端全部内容按「远端新增、本机未动」回填 live（并集下载），
   // 否则新机器只在远端文件发生后续变更时才拿得到它们（真机联调发现的缺口）
-  const lastSynced = state.lastSyncedCommit || '4b825dc642cb6eb9a060e54bf8d69288fbee4904'
+  const prevSynced = state.lastSyncedCommit || null
+  // 基线守护（0.4.8）：远端 main 被改写/回退后旧基线不再是 FETCH_HEAD 的祖先，
+  // 直接拿它 diff 会把所有内容不同的文件都当成「远端改过」（见 resolveSyncBase）。
+  const syncBase = await resolveSyncBase(binary, repoDir, prevSynced, logger)
+  const noCommonBase = Boolean(prevSynced) && syncBase === null
+  const diffBase = syncBase || EMPTY_TREE_HASH
   let changedRaw = ''
-  try { changedRaw = await gitExec(binary, ['diff', '--name-only', lastSynced, 'FETCH_HEAD'], repoDir) } catch {}
+  try { changedRaw = await gitExec(binary, ['diff', '--name-only', diffBase, 'FETCH_HEAD'], repoDir) } catch {}
   const changed = changedRaw.split(/\r?\n/).map(s => s.trim()).filter(Boolean)
   // 逐文件基线：bothModified 文件在解决前基线不能跟着 lastSyncedCommit 前进
   // （真机实证：基线被推进到远端 tip 后，AI 对齐看到「远端==基线 → 保留本机」，
   // 对端改动在下一次推送时被覆盖）。pendingBoth 记住每个未解决文件的真基线。
   state.pendingBoth = state.pendingBoth && typeof state.pendingBoth === 'object' ? state.pendingBoth : {}
+  // 挂账复核（0.4.8）：记账基线同样失效的挂账在这里销账/修正——否则它每轮都被
+  // preserve 回退成远端版本，本机版本永远推不上去（真机会话日志实证）
+  const pendingReview = await revalidatePendingBoth(binary, repoDir, state, logger)
   const applied = []        // safely written back to live
   const bothModified = []   // both sides changed → AI align / conflict PR
   const remoteDeleted = []  // gone on remote; live keeps its copy
   const localKept = []      // machine-owned plugin manifests the remote may not touch
+  const skipNoBase = []     // no common baseline: live files left untouched
   for (const p of changed) {
     const livePath = resolveLivePath(spec, p)
     if (!livePath) continue
@@ -1133,8 +1220,10 @@ async function reconcileRemote(binary, eff, { repoDir, state, logger, roots }) {
       try { await atomicWriteFile(livePath, remoteBuf); applied.push(p) } catch {}
       continue
     }
-    // 未解决文件的基线固定在首次发现冲突时的 commit，其余文件跟随 lastSynced
-    const fileBase = state.pendingBoth[p] || lastSynced
+    // 无共同基线：无法判断远端是否动过，本机已有的文件一律保持不动（不覆盖、不挂账）
+    if (noCommonBase && liveBuf !== null) { skipNoBase.push(p); continue }
+    // 未解决文件的基线固定在首次发现冲突时的 commit，其余文件跟随修正后的基线
+    const fileBase = state.pendingBoth[p] || diffBase
     let baseBuf = null
     try { baseBuf = await gitShowBuf(binary, `${fileBase}:${p}`, repoDir) } catch { baseBuf = Buffer.alloc(0) }
     if (liveBuf !== null && Buffer.compare(liveBuf, remoteBuf) === 0) {
@@ -1168,7 +1257,12 @@ async function reconcileRemote(binary, eff, { repoDir, state, logger, roots }) {
   await gitExec(binary, ['checkout', eff.branch], repoDir).catch(() => {})
   await gitExec(binary, ['reset', '--hard', 'FETCH_HEAD'], repoDir).catch(() => {})
   state.lastSyncedCommit = await gitCurrentCommit(binary, repoDir)
-  return { reconciled: true, applied, bothModified, remoteDeleted, localKept, changed: changed.length }
+  return {
+    reconciled: true, applied, bothModified, remoteDeleted, localKept, changed: changed.length,
+    // 基线守护的可见结果：基线被改写（修正/无法定位共同祖先）、挂账被自动销账的文件
+    baselineRewritten: Boolean(prevSynced) && syncBase !== prevSynced,
+    noCommonBase, pendingCleared: pendingReview.cleared, skipNoBase,
+  }
 }
 
 // ── Snapshots: local-first, cloud only when explicitly checked ──────────
@@ -1819,14 +1913,31 @@ const REMOTE_ALIGN_PROMPT_ZH = [
 // ② RPC 端点从点号（session.create）改成斜杠两段式（session/create，与 typert
 //    namespace/method 对应），payload 必须包成 {args:{request:…}}；0.1.1-rc.2 仍是
 //    点号 + 平铺 payload，404 时回退重试。cookie 由宿主 connection 服务铸造。
-const APIPROXY_BASE = process.env.DSH_WEB_URL || 'http://127.0.0.1:3080'
+// apiproxy 基地址 = 宿主实际监听的回环地址。桌面版插件进程**没有** DSH_WEB_URL 环境
+// 变量（那是 `dsh web` CLI 注册给会话的），而这里原先写死 3080：桌面宿主用的是随机
+// 端口（真机实测 43120），于是桌面版下 AI 智能对齐 / AI 解决冲突 / 远端 AI 对齐一律
+// `fetch failed`，面板只显示裸 fetch failed，无从判断（真机实证 2026-10-06）。
+// 优先级：宿主 webServer.port（apply 时注入）> DSH_WEB_URL（dsh web CLI）> 3080 兜底。
+const APIPROXY_FALLBACK_BASE = process.env.DSH_WEB_URL || 'http://127.0.0.1:3080'
+let apiproxyBase = APIPROXY_FALLBACK_BASE
+function setApiproxyPort(port) {
+  const n = Number(port)
+  if (Number.isFinite(n) && n > 0) apiproxyBase = `http://127.0.0.1:${n}`
+  return apiproxyBase
+}
+// 网络层失败要带上试过的基地址：否则只有 undici 的裸 `fetch failed`，看不出是端口
+// 不对、认证失败还是路由缺失（桌面版 3080 就是被这条坑掉的）
+function apiproxyUnreachable(e) {
+  return new Error(`apiproxy 连接失败（基地址 ${apiproxyBase}）：${(e && e.message) || e}` +
+    '。桌面版应取宿主实际端口；dsh web 默认 3080，可用 DSH_WEB_URL 覆盖')
+}
 let connectionSvcRef = null
 let authedUrlCache = null
 let cookieCache = null
 
 async function mintCookie() {
   if (!authedUrlCache && connectionSvcRef && typeof connectionSvcRef.authenticatedUrl === 'function') {
-    try { authedUrlCache = connectionSvcRef.authenticatedUrl(APIPROXY_BASE) } catch { authedUrlCache = null }
+    try { authedUrlCache = connectionSvcRef.authenticatedUrl(apiproxyBase) } catch { authedUrlCache = null }
   }
   if (!authedUrlCache) return null
   let setCookies = []
@@ -1843,11 +1954,14 @@ async function mintCookie() {
 
 async function apiproxyCall(methodSlash, request, cookie) {
   const rpcId = 'dshsync-' + Date.now().toString(36) + Math.random().toString(36).slice(2, 6)
-  const r = await fetch(`${APIPROXY_BASE}/api/${methodSlash}`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', ...(cookie ? { Cookie: cookie } : {}) },
-    body: JSON.stringify({ type: 'client-request', rpcId, method: methodSlash, payload: { args: { request } } }),
-  })
+  let r
+  try {
+    r = await fetch(`${apiproxyBase}/api/${methodSlash}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', ...(cookie ? { Cookie: cookie } : {}) },
+      body: JSON.stringify({ type: 'client-request', rpcId, method: methodSlash, payload: { args: { request } } }),
+    })
+  } catch (e) { throw apiproxyUnreachable(e) }
   if (r.status === 401) return { unauthorized: true }
   if (r.status === 404) return { notFound: true }
   const j = await r.json().catch(() => ({}))
@@ -1857,11 +1971,14 @@ async function apiproxyCall(methodSlash, request, cookie) {
 // 0.1.1-rc.2 回退：点号端点 + 平铺 payload、无认证
 async function apiproxyLegacy(dotted, request) {
   const rpcId = 'dshsync-' + Date.now().toString(36) + Math.random().toString(36).slice(2, 6)
-  const r = await fetch(`${APIPROXY_BASE}/api/${dotted}`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ type: 'client-request', rpcId, method: dotted, payload: request }),
-  })
+  let r
+  try {
+    r = await fetch(`${apiproxyBase}/api/${dotted}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ type: 'client-request', rpcId, method: dotted, payload: request }),
+    })
+  } catch (e) { throw apiproxyUnreachable(e) }
   const j = await r.json().catch(() => ({}))
   return j.result
 }
@@ -1984,12 +2101,19 @@ module.exports = {
     // 多协议备份（导出供测试）
     gitProtocolOn, resolveBackupProtocols, backupLayoutSpec, stageBackupTree, uploadBackupToOne, runBackupUpload, promoteSnapshotToProtocol, fetchSnapshotFromProtocol,
     __setConnection(svc) { connectionSvcRef = svc }, __resetApiproxyCache() { authedUrlCache = null; cookieCache = null },
+    // 同步基线守护（0.4.8，导出供离线测试）
+    resolveSyncBase, revalidatePendingBoth, EMPTY_TREE_HASH,
+    // apiproxy 基地址（0.4.8：桌面版取宿主实际端口，导出供测试）
+    setApiproxyPort, apiproxyBaseNow: () => apiproxyBase, APIPROXY_FALLBACK_BASE,
     syncSettingsSchema, Config, parseLegacySettingsYaml, __seedLegacyYaml,
     // 设置持久化（导出供测试）：自铸 Config + 自持设置文件
     buildFallbackConfig, parseSettingsFile, parseClearedKeys, pickFileSettingsLayer, Schema,
     getSchemaInfo: () => ({ schemaKind, schemasterySource, lastSchemasteryError }) },
 
   apply(ctx, config = {}) {
+    // 桌面宿主用随机端口（真机 43120），apiproxy 依赖的基地址必须取宿主实际监听端口；
+    // 静态 inject 列表里已有 webServer，这里在注册路由/建 job 之前先对齐基地址。
+    try { setApiproxyPort(ctx.webServer && ctx.webServer.port) } catch {}
     const dh = dshHome()
     const syncDir = join(dh, 'dsh-sync')
     const repoDir = join(syncDir, 'repo')

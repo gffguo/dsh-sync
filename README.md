@@ -51,10 +51,10 @@ dsh plugin --profile web add @weibaohui/dsh-sync -w
 
 ```bash
 npm run check          # 语法检查（src + client）
-npm test               # 离线测试 79 项
+npm test               # 离线测试 82 项
 npm run build:client   # 改了 client/index.js 必须先重建，否则打进去的是旧界面
 npm pack               # → weibaohui-dsh-sync-<version>.tgz
-tar -tzf weibaohui-dsh-sync-0.4.7.tgz   # 应只含 src/、client/、cordis.patch.yml、package.json、README.md
+tar -tzf weibaohui-dsh-sync-0.4.8.tgz   # 应只含 src/、client/、cordis.patch.yml、package.json、README.md
 ```
 
 发布时 `npm publish` 会自动跑 `prepublishOnly`（build:client + check + test），无需手工前置。
@@ -64,7 +64,7 @@ tar -tzf weibaohui-dsh-sync-0.4.7.tgz   # 应只含 src/、client/、cordis.patc
 Desktop 的 profile 名是 `desktop`；**先完全退出 Desktop**（profile 的 `package.json` 有文件锁）：
 
 ```bash
-dsh plugin --profile desktop add file:C:\path\to\weibaohui-dsh-sync-0.4.7.tgz
+dsh plugin --profile desktop add file:C:\path\to\weibaohui-dsh-sync-0.4.8.tgz
 # 或从 npm 装发布版：dsh plugin --profile desktop add @weibaohui/dsh-sync -w
 # 普通 web profile：dsh plugin --profile web add @weibaohui/dsh-sync -w
 ```
@@ -147,9 +147,9 @@ New-Item -ItemType Junction -Path $dst -Target "D:\GfKaifaApplication\dsh-sync"
 - **非 GitCode 的功能差异**：PR 创建/合并、「AI 冲突处理」(`conflict/run`)、「清理遗留分支」(`prune-branches`) 目前仍是 GitCode 专属；其他托管方走「只推分支」的降级路径（`prSkipped`），这些入口会返回明确错误而不是静默失败。
 - **登录用户名按托管方**：GitHub 需要 `x-access-token`，其余用 `oauth2`（经 `DSH_SYNC_USER` 传给 askpass 助手；token 依旧只走环境变量、不进 argv）。
 
-## 更新日志（0.4.3 → 0.4.7）
+## 更新日志（0.4.3 → 0.4.8）
 
-0.4.3–0.4.5 围绕同一条问题链：**「点保存 → 提示成功 → 重启 dsh 后设置回到默认」**。0.4.3 修根因，0.4.4 补面板状态层与保存语义，0.4.5 扩展托管方并明确泄露风险闸门；0.4.6 收尾同一批 Windows 环境下暴露的问题（覆盖镜像不生效 + 测试夹具的环境假设）；0.4.7 修另一条独立的线：「浏览远端」报 400（浏览 ref 的非快进更新被 git 拒绝）。
+0.4.3–0.4.5 围绕同一条问题链：**「点保存 → 提示成功 → 重启 dsh 后设置回到默认」**。0.4.3 修根因，0.4.4 补面板状态层与保存语义，0.4.5 扩展托管方并明确泄露风险闸门；0.4.6 收尾同一批 Windows 环境下暴露的问题（覆盖镜像不生效 + 测试夹具的环境假设）；0.4.7 修另一条独立的线：「浏览远端」报 400（浏览 ref 的非快进更新被 git 拒绝）；0.4.8 修桌面版 AI 对齐不可用（apiproxy 基地址写死 3080）与「远端 main 被改写后同步基线失效、会话日志永久挂账」。
 
 ### 0.4.3 —— 修复「保存后重启又回默认」
 
@@ -235,6 +235,29 @@ New-Item -ItemType Junction -Path $dst -Target "D:\GfKaifaApplication\dsh-sync"
 
 **临时绕过（0.4.7 之前）**：`git -C "$env:USERPROFILE\.dsh\dsh-sync\repo" update-ref -d refs/dshsync/browse`，下次浏览会以「首次写入」成功。
 
+### 0.4.8 —— 桌面版 AI 对齐不可用 + 同步基线失效导致会话永久挂账
+
+**现象 1（桌面版）**：设置页点「AI 智能对齐」，输出框里只有一行 `fetch failed`（「AI 解决冲突」同样）；`dsh web` 下却正常。
+
+**根因 1**：apiproxy 基地址写死 `http://127.0.0.1:3080`（只有环境变量 `DSH_WEB_URL` 能覆盖，而该变量仅 `dsh web` CLI 会注入会话环境）。桌面宿主的 Web 服务用随机端口（本机实测 `127.0.0.1:43120`），插件进程里仍是 3080 → undici 直接抛 `fetch failed`，异常被 agent 任务的 `catch` 原样写进 `job.output`，界面上就只剩这一行，看不到任何原因。
+
+**改动 1**：
+
+- 新增 `setApiproxyPort(port)`；`apply()` 里用 `ctx.webServer.port` 覆盖基地址（与宿主自己的 `authenticatedUrl(desktopLoopbackBrowserUrl(webServer.port))` 同一口径），`DSH_WEB_URL` 与 3080 保留为兜底；
+- 网络失败重新包装成 `apiproxy 连接失败（基地址 http://127.0.0.1:43120）：…`，不再只给裸 `fetch failed`。
+
+**现象 2（Windows / 多机）**：同步后云端 `sessions/` 一直停在很久以前的提交，本机会话日志推不上去，插件自己的状态里 `pendingBoth` 挂着一个 `session.v4.jsonl.zstd`，「待语义合并文件」每轮都是它。
+
+**根因 2**：`state.lastSyncedCommit` 里的旧远端 main 被改写（force-push、或平台合并 PR 丢弃了旧 tip）后，旧提交在本机对象库里还在，却已不是新 main 的祖先。`reconcileRemote` 直接 `git diff lastSynced FETCH_HEAD` 来判定「远端改过哪些文件」——凡是内容与旧 tip 不同的文件都算「远端改过」，于是一直在追写的会话日志被误判 bothModified → 推送时按 `preserve` 把它在影子仓库里回退成远端版本（`git checkout FETCH_HEAD -- <path>`）→ 写进 `pendingBoth` 并逐轮携带，只有 AI 对齐成功才会销账；而 AI 对齐恰好就是现象 1 挂掉的那条路 ⇒ 永久卡死（每次同步只推得动 plugins）。
+
+**改动 2**：
+
+- 新增 `resolveSyncBase()`：`git merge-base --is-ancestor <lastSynced> FETCH_HEAD` 不成立时退化为 `git merge-base`（真正的共同祖先）；连共同祖先都没有（无关历史）则按「基线重建」处理，不把本地文件当成远端改动；reconcile 与 pull 两条路径都改用它；
+- 新增 `revalidatePendingBoth()`：挂账基线已失效时重新核对——远端在纠正后的基线上确实没改过该文件就**自动销账**（本地版本下次同步正常推送），真改过则把记账基线修正到共同祖先；**升级到 0.4.8 后，本机现存的这种挂账会自己解开**；
+- `runPush` 的未合并/异常返回路径（无新提交、PR 有冲突、抛错）统一走 `restoreBaseline()`：把影子仓库 HEAD 恢复到远端 main 并同步 `lastSyncedCommit`，避免下一轮基线与 `FETCH_HEAD` 错位。
+
+**验证**：离线测试 82 项，新增 `test/baseline-guard.test.mjs` 3 项——基线可达性判定（可达/被丢弃的旧 tip/无关历史/未同步）、挂账复核（失效挂账自动销账 + 真改过的挂账基线修正）、apiproxy 基地址（3080 兜底、宿主端口覆盖、失败信息带基地址）；git 侧语义用本地仓库复核（`merge-base --is-ancestor` 退出码、`merge-base` 回退值、`diff --name-only <共同祖先> FETCH_HEAD -- <path>` 对远端未改动的文件为空）。
+
 ## 联系我 :飞书群
 
 ![link](https://foruda.gitee.com/images/1774880015525784725/4fd67005_77493.png "link")
@@ -243,10 +266,11 @@ New-Item -ItemType Junction -Path $dst -Target "D:\GfKaifaApplication\dsh-sync"
 
 本插件与 [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness)（`@deepseek-ai/dsh`）的版本对应关系：
 
-> 0.4.3 / 0.4.4 / 0.4.5 / 0.4.6 / 0.4.7 五个版本的详细改动说明见上文「更新日志（0.4.3 → 0.4.7）」。
+> 0.4.3 / 0.4.4 / 0.4.5 / 0.4.6 / 0.4.7 / 0.4.8 六个版本的详细改动说明见上文「更新日志（0.4.3 → 0.4.8）」。
 
 | 插件版本 | 适配 dsh 版本 | 备注 |
 |---------|--------------|------|
+| 0.4.8 | 0.1.7-rc.2 | 修复两条与 Windows/桌面版相关的独立问题：(1) **桌面版 AI 智能对齐/解决冲突只报 `fetch failed`**——apiproxy 基地址写死 `http://127.0.0.1:3080`，而桌面宿主 Web 服务用随机端口（实测 43120），改为 `apply()` 用 `ctx.webServer.port` 覆盖（`DSH_WEB_URL`/3080 保留兜底），网络错误信息带上尝试过的基地址；(2) **远端 main 被改写后同步基线失效 → 会话日志永久挂账**——`lastSyncedCommit` 不再是远端 tip 的祖先时 `git diff 基线 FETCH_HEAD` 会把本机正在写的文件误判 bothModified（推送时按 preserve 回退成远端版本，且只能靠 AI 对齐销账），新增 `resolveSyncBase()` 退化到 `git merge-base`、`revalidatePendingBoth()` 自动销账失效挂账、`runPush` 未合并路径 `restoreBaseline()` 恢复 HEAD；离线测试 82 项（新增 3 例基线守护/apiproxy 回归） |
 | 0.4.7 | 0.1.7-rc.2 | 修复：Git 页签「浏览远端」报 400。浏览 ref（`refs/dshsync/browse`）相对远端 main 常处于回退状态，refspec 无 `+` 时 git 以 `non-fast-forward` 拒绝（远端对象已取回、`FETCH_HEAD` 已写，仅本地 ref 不动）→ 改为强制更新；客户端 `getJson` 失败时读响应体 `error`，不再只显示 `HTTP 400`；离线测试 79 项（新增 1 例浏览回归） |
 | 0.4.6 | 0.1.7-rc.2 | 修复 Windows：远端为准（只读镜像）策略的覆盖循环因 git 路径引号转义 + 分隔符不一致而静默空转（`gitDiffNameStatus` 改 `-z` 解析 + `normGitPath` 归一化比较）；镜像写入改为从 HEAD 取仓库原始字节，不受 `core.autocrlf` 影响；同步修掉 4 例只在 Windows 必失败的上游测试环境假设（conflict-ai 夹具路径、askpass 的 `/bin/sh`）；离线测试 78 项 |
 | 0.4.5 | 0.1.7-rc.2 | 新增 GitHub / GitLab / Gitee 托管方（页面按钮组，默认 GitCode）；provider 感知的私仓校验（GitHub/GitLab/Gitee 走各自 REST，自建/未知主机无法校验 → 保存时风险确认 + `UNVERIFIED_REPO`/`allowUnverifiedRepo`）；非 GitCode 时 `prune-branches`/`conflict/run` 给出准确错误；askpass 用户名按 provider（GitHub `x-access-token`）；离线测试 78 项 |
