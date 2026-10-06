@@ -442,7 +442,17 @@ window.__ModuleLoader__.load({
     
     async function getJson(url) {
       const r = await fetch(url)
-      if (!r.ok) throw new Error('HTTP ' + r.status)
+      if (!r.ok) {
+        // Surface the server's own message (e.g. git's "! [rejected] (non-fast-forward)")
+        // instead of a bare status code; the API returns { error } for failures.
+        let msg = 'HTTP ' + r.status
+        try {
+          const d = await r.json()
+          if (d && d.error) msg = String(d.error)
+          else if (d && d.code) msg = String(d.code)
+        } catch { /* body not JSON — keep the status code */ }
+        throw new Error(msg.length > 300 ? msg.slice(0, 300) + '…' : msg)
+      }
       return r.json()
     }
     

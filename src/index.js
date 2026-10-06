@@ -1373,8 +1373,10 @@ async function fetchSnapshotFromProtocol(proto, { instanceId, snapName }, destDi
 
 // ── Remote backup browser: list instances + tree, selectively pull with
 //    safety guards. Browse is read-only against the git object DB — main is
-//    fetched into a dedicated ref (refs/dshsync/browse) so it never touches
-//    FETCH_HEAD and cannot race the sync loop's fetch/checkout. Pull applies
+//    fetched into a dedicated ref (refs/dshsync/browse) so the browse cache
+//    never shares the sync loop's branch/worktree state (a dest-refspec fetch
+//    does still write FETCH_HEAD — always the same branch tip the loop itself
+//    fetches, see fetchBrowseRef below). Pull applies
 //    remote files to live with the same crash-learned guards as
 //    reconcileRemote: another machine's plugin manifests and settings.yaml
 //    are never wholesale-replaced (real crashes documented inline above). ──
@@ -1448,14 +1450,19 @@ function parseLsTree(raw) {
   }).filter(Boolean)
 }
 
-/** Fetch main into the dedicated browse ref. Race-free: the refspec
- *  `<branch>:refs/dshsync/browse` writes only that local ref — FETCH_HEAD
- *  is untouched, so the sync loop's fetch→checkout→reset sequence can't be
- *  disturbed by a concurrent browse. */
+/** Fetch main into the dedicated browse ref. The refspec is forced (`+`):
+ *  BROWSE_REF is a plugin-private namespace that is routinely rewound relative
+ *  to remote main — every PR merge/rebase moves main off the previously cached
+ *  commit — and git rejects a non-fast-forward update of it with
+ *  `! [rejected] ... (non-fast-forward)`, which surfaced as an HTTP 400 on
+ *  "浏览远端" until the cached ref was deleted by hand.
+ *  Note: a dest-refspec fetch does write FETCH_HEAD (with the same branch tip
+ *  the sync loop fetches, so a concurrent browse can't change its outcome);
+ *  earlier comments here wrongly claimed FETCH_HEAD stayed untouched. */
 async function fetchBrowseRef(binary, eff, repoDir) {
   const remote = eff.repoUrl, authEnv = gitAuthEnv(eff)
   try {
-    await gitExec(binary, ['fetch', remote, `${eff.branch}:${BROWSE_REF}`], repoDir, authEnv)
+    await gitExec(binary, ['fetch', remote, `+${eff.branch}:${BROWSE_REF}`], repoDir, authEnv)
     return true
   } catch (e) {
     if (/Could not find|doesn't exist|empty|unborn/i.test(String(e && e.message))) return false

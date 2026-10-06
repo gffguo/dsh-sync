@@ -31,7 +31,7 @@
 - **AI 一键解决冲突**：出现冲突时设置页冒出「AI 解决冲突」按钮，点击后由系统取回冲突分支与 main 制造冲突工作树，AI 只做本地语义解冲突，推送与 PR 合并由系统自动完成
 - **浏览远端备份**：点「浏览远端」可查看云端仓库的完整目录树，自动识别 `backup/<实例ID>/` 下每台机器的备份并标记本机；在树中勾选文件后「预览拉取」会给出安全判定（哪些可拉、哪些会被阻止及原因），确认后才写入本地——写入前自动拍一份 pre-remote-pull 安全快照
   - 跨机安全提示（不阻止拉取）：另一台机器的 **插件清单**（本地已有时）和 **settings.yaml** 跨机拉取时会⚠警告（覆盖机器专属配置可能导致宿主崩溃），但允许用户自行决定是否拉取；**技能文件**可安全跨机拉取；本机自己的备份无警告（恢复语义）
-  - 浏览是只读的：远端 main 拉进独立 ref（`refs/dshsync/browse`），不触碰 FETCH_HEAD，与同步循环无竞争
+  - 浏览是只读的：远端 main 拉进独立 ref（`refs/dshsync/browse`，**强制更新**——该 ref 相对远端 main 常处于回退状态，见 0.4.7），不写工作树、不动分支，与同步循环无竞争（有目标 refspec 的 fetch 会写 `FETCH_HEAD`，写的是同步循环自己也会取的同一个分支 tip）
 - **安全（0.4.5 起支持多托管方）**：GitCode（默认）/ GitHub / GitLab / Gitee 四个托管方，保存时按 host 调 REST 判定仓库是否私有，**公共仓库一律拒绝保存**；自建/未知主机的私有性**无法校验**，保存前必须由用户在风险弹窗里显式确认（见「托管方支持与泄露风险」）；访问 token 只写不回读
 - **凭据不出域**：AI agent（冲突处理/智能对齐/远端对齐）的提示词**不含任何访问令牌**——需要凭据的 git 推送、PR 查询/合并全部由插件 host 侧完成，token 不会随提示词发送给模型服务（0.4.1 修复）。git 子进程同样不经 argv 携带 token（argv 可被 `ps` 全机看到），改为 `GIT_ASKPASS` 环境变量注入（0.4.1）；`conflictMode=manual` 时所有 AI 入口（自动触发 + 手动按钮）一律关闭，`ai` 才放行
 - **残余风险提示**：「智能对齐」的本质是把待合并文件的内容交给模型做语义判断——若 `settings.yaml` 等文件内含其他机密（如模型 apiKey），这些值仍会进入模型上下文（这是语义合并功能的固有性质，无法在保留功能的前提下消除）；介意者请把 `conflictMode` 设为 `manual` 或关闭对应同步开关
@@ -51,10 +51,10 @@ dsh plugin --profile web add @weibaohui/dsh-sync -w
 
 ```bash
 npm run check          # 语法检查（src + client）
-npm test               # 离线测试 78 项
+npm test               # 离线测试 79 项
 npm run build:client   # 改了 client/index.js 必须先重建，否则打进去的是旧界面
 npm pack               # → weibaohui-dsh-sync-<version>.tgz
-tar -tzf weibaohui-dsh-sync-0.4.6.tgz   # 应只含 src/、client/、cordis.patch.yml、package.json、README.md
+tar -tzf weibaohui-dsh-sync-0.4.7.tgz   # 应只含 src/、client/、cordis.patch.yml、package.json、README.md
 ```
 
 发布时 `npm publish` 会自动跑 `prepublishOnly`（build:client + check + test），无需手工前置。
@@ -64,7 +64,7 @@ tar -tzf weibaohui-dsh-sync-0.4.6.tgz   # 应只含 src/、client/、cordis.patc
 Desktop 的 profile 名是 `desktop`；**先完全退出 Desktop**（profile 的 `package.json` 有文件锁）：
 
 ```bash
-dsh plugin --profile desktop add file:C:\path\to\weibaohui-dsh-sync-0.4.6.tgz
+dsh plugin --profile desktop add file:C:\path\to\weibaohui-dsh-sync-0.4.7.tgz
 # 或从 npm 装发布版：dsh plugin --profile desktop add @weibaohui/dsh-sync -w
 # 普通 web profile：dsh plugin --profile web add @weibaohui/dsh-sync -w
 ```
@@ -147,9 +147,9 @@ New-Item -ItemType Junction -Path $dst -Target "D:\GfKaifaApplication\dsh-sync"
 - **非 GitCode 的功能差异**：PR 创建/合并、「AI 冲突处理」(`conflict/run`)、「清理遗留分支」(`prune-branches`) 目前仍是 GitCode 专属；其他托管方走「只推分支」的降级路径（`prSkipped`），这些入口会返回明确错误而不是静默失败。
 - **登录用户名按托管方**：GitHub 需要 `x-access-token`，其余用 `oauth2`（经 `DSH_SYNC_USER` 传给 askpass 助手；token 依旧只走环境变量、不进 argv）。
 
-## 更新日志（0.4.3 → 0.4.6）
+## 更新日志（0.4.3 → 0.4.7）
 
-0.4.3–0.4.5 围绕同一条问题链：**「点保存 → 提示成功 → 重启 dsh 后设置回到默认」**。0.4.3 修根因，0.4.4 补面板状态层与保存语义，0.4.5 扩展托管方并明确泄露风险闸门；0.4.6 收尾同一批 Windows 环境下暴露的问题（覆盖镜像不生效 + 测试夹具的环境假设）。
+0.4.3–0.4.5 围绕同一条问题链：**「点保存 → 提示成功 → 重启 dsh 后设置回到默认」**。0.4.3 修根因，0.4.4 补面板状态层与保存语义，0.4.5 扩展托管方并明确泄露风险闸门；0.4.6 收尾同一批 Windows 环境下暴露的问题（覆盖镜像不生效 + 测试夹具的环境假设）；0.4.7 修另一条独立的线：「浏览远端」报 400（浏览 ref 的非快进更新被 git 拒绝）。
 
 ### 0.4.3 —— 修复「保存后重启又回默认」
 
@@ -218,6 +218,23 @@ New-Item -ItemType Junction -Path $dst -Target "D:\GfKaifaApplication\dsh-sync"
 - `test/conflict-ai.test.mjs`：夹具用 `join(seed,'skills','foo.md').replace('skills/foo.md','foo.md')` 改写路径，Windows 下 `join` 产出反斜杠、replace 不匹配 → 改为直接 `join(seed,'foo.md')`；裸仓库路径同时当 `eff.repoUrl`，而 `parseRepoUrl` 只认 `gitcode.com/<owner>/<repo>`，Windows 反斜杠路径解析为 null 会让 `finalizeConflictBranch` 提前返回 `merged:true` → 传给 `eff.repoUrl` 前把分隔符转成 `/`；
 - `test/sync.test.mjs`：askpass 用例硬编码 `execFile('/bin/sh', ...)`，Windows 上没有 `/bin/sh`（Git for Windows 自带 `usr/bin/sh.exe`）→ 先探测 `/bin/sh` 与 PATH 中 `git.exe` 旁边的 `usr/bin/sh.exe`，都找不到才 skip 该用例。
 
+### 0.4.7 —— 修复「浏览远端」报 400（非快进 ref 更新被拒）
+
+**现象**：Git 页签点「浏览远端」只弹一行 `HTTP 400`，不给任何原因；换安装方式（本地编译、tgz、npm）都一样。
+
+**根因**：浏览会把远端 main 抓进插件私有 ref `refs/dshsync/browse`，refspec 是 `<branch>:refs/dshsync/browse`（没有 `+`）。这个 ref 会相对远端 main「回退」——每次 PR 合并/变基都会让 main 走到不再是缓存提交后代的位置。此时 git 以 `! [rejected] main -> refs/dshsync/browse (non-fast-forward)` 拒绝更新（实测：远端对象已取回、`FETCH_HEAD` 照写，只有本地 ref 不动），`fetchBrowseRef` 抛错 → 服务端 `catch` 返回 `400 {error}`。
+
+现场证据（本机影子仓库 `~/.dsh/dsh-sync/repo`）：`refs/dshsync/browse` 停在 `75b890bf…`（22:06:15 首次写入成功），而远端 main 已是 `2603c1a4…`（本地 22:54 同步经 PR 合入后拉到的提交），`git merge-base --is-ancestor 75b890bf… 2603c1a4…` 退出码 1（非祖先）；22:56:25 那次 fetch 写了 `FETCH_HEAD`、改了 `.git/objects`，唯独 ref 没动 —— 正是「非快进被拒」的签名。所以这是「用过一次之后迟早会坏」的 bug，与安装方式无关。
+
+**改动**：
+
+1. `src/index.js` 的 `fetchBrowseRef`：refspec 改为 `+<branch>:refs/dshsync/browse`（强制更新）。该 ref 是插件私有命名空间，强更没有副作用；顺带更正了「浏览不触碰 FETCH_HEAD」的错误注释与本文档描述（有目标 refspec 的 fetch 确实会写 `FETCH_HEAD`，写的是同步循环自己也会取的同一个分支 tip）；
+2. `client/index.js` 的 `getJson`：失败时读响应体，把服务端的 `error`（或 `code`）文本作为错误信息抛出（超 300 字符截断）。此前只抛 `'HTTP ' + r.status`，所以任何 400 在界面上都只剩一个状态码。
+
+**验证**：新增回归用例「浏览远端：远端 main 非快进前进后仍能浏览」（`test/remote-browse.test.mjs`）；机制侧用 git bundle 内部传输复现非快进拒绝（`! [rejected] … (non-fast-forward)`、`FETCH_HEAD` 仍被写、ref 不变），refspec 加 `+` 后变为 `(forced update)`。
+
+**临时绕过（0.4.7 之前）**：`git -C "$env:USERPROFILE\.dsh\dsh-sync\repo" update-ref -d refs/dshsync/browse`，下次浏览会以「首次写入」成功。
+
 ## 联系我 :飞书群
 
 ![link](https://foruda.gitee.com/images/1774880015525784725/4fd67005_77493.png "link")
@@ -226,10 +243,11 @@ New-Item -ItemType Junction -Path $dst -Target "D:\GfKaifaApplication\dsh-sync"
 
 本插件与 [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness)（`@deepseek-ai/dsh`）的版本对应关系：
 
-> 0.4.3 / 0.4.4 / 0.4.5 / 0.4.6 四个版本的详细改动说明见上文「更新日志（0.4.3 → 0.4.6）」。
+> 0.4.3 / 0.4.4 / 0.4.5 / 0.4.6 / 0.4.7 五个版本的详细改动说明见上文「更新日志（0.4.3 → 0.4.7）」。
 
 | 插件版本 | 适配 dsh 版本 | 备注 |
 |---------|--------------|------|
+| 0.4.7 | 0.1.7-rc.2 | 修复：Git 页签「浏览远端」报 400。浏览 ref（`refs/dshsync/browse`）相对远端 main 常处于回退状态，refspec 无 `+` 时 git 以 `non-fast-forward` 拒绝（远端对象已取回、`FETCH_HEAD` 已写，仅本地 ref 不动）→ 改为强制更新；客户端 `getJson` 失败时读响应体 `error`，不再只显示 `HTTP 400`；离线测试 79 项（新增 1 例浏览回归） |
 | 0.4.6 | 0.1.7-rc.2 | 修复 Windows：远端为准（只读镜像）策略的覆盖循环因 git 路径引号转义 + 分隔符不一致而静默空转（`gitDiffNameStatus` 改 `-z` 解析 + `normGitPath` 归一化比较）；镜像写入改为从 HEAD 取仓库原始字节，不受 `core.autocrlf` 影响；同步修掉 4 例只在 Windows 必失败的上游测试环境假设（conflict-ai 夹具路径、askpass 的 `/bin/sh`）；离线测试 78 项 |
 | 0.4.5 | 0.1.7-rc.2 | 新增 GitHub / GitLab / Gitee 托管方（页面按钮组，默认 GitCode）；provider 感知的私仓校验（GitHub/GitLab/Gitee 走各自 REST，自建/未知主机无法校验 → 保存时风险确认 + `UNVERIFIED_REPO`/`allowUnverifiedRepo`）；非 GitCode 时 `prune-branches`/`conflict/run` 给出准确错误；askpass 用户名按 provider（GitHub `x-access-token`）；离线测试 78 项 |
 | 0.4.4 | 0.1.7-rc.2 | 面板/状态层与保存语义：状态轮询失败不再静默（错误行 + 重试）、用户编辑期间不再被轮询覆盖、token「已配置」标记、「清空仓库地址」按钮；PUT 支持 `null` 显式清除（空串 = 保持不变）并回传 `applied`/`ignored`/`cleared`/`persist`；被清除的键写进自持文件墓碑（`cleared`），避免重启后被宿主 config 层复活；`gitAvailable` 加 60s 缓存；离线测试 72 项 |
