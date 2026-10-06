@@ -258,6 +258,12 @@ New-Item -ItemType Junction -Path $dst -Target "D:\GfKaifaApplication\dsh-sync"
 
 **验证**：离线测试 82 项，新增 `test/baseline-guard.test.mjs` 3 项——基线可达性判定（可达/被丢弃的旧 tip/无关历史/未同步）、挂账复核（失效挂账自动销账 + 真改过的挂账基线修正）、apiproxy 基地址（3080 兜底、宿主端口覆盖、失败信息带基地址）；git 侧语义用本地仓库复核（`merge-base --is-ancestor` 退出码、`merge-base` 回退值、`diff --name-only <共同祖先> FETCH_HEAD -- <path>` 对远端未改动的文件为空）。
 
+**真机验证（2026-10-07，Windows + DSH Desktop，实装 0.4.8）**：
+
+- 「AI 智能对齐」不再报 `fetch failed`（基地址取到宿主随机端口，本机实测 `http://127.0.0.1:43120`）；
+- 升级后本机原有的挂账自动解开：`state.pendingBoth` 归空，影子仓库 `sessions/` 出现新提交 `2e930da`（2026-10-07 00:32:48），并随 PR `!25` 合并进远端 main（`d6b1a13`），`lastSyncedCommit` 随之更新；此前该会话卡了约 3 小时 45 分，期间每轮只推得动 `plugins/`；
+- 用户在本机确认：设置页「AI 智能对齐」正常，点击同步后 `session` 也能同步上去。
+
 ## 联系我 :飞书群
 
 ![link](https://foruda.gitee.com/images/1774880015525784725/4fd67005_77493.png "link")
