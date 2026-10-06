@@ -205,7 +205,7 @@ New-Item -ItemType Junction -Path $dst -Target "D:\GfKaifaApplication\dsh-sync"
 - `gitDiffNameStatus` 改用 `git diff --no-index --name-status --no-renames -z`，返回 `[status, path]` 数组（NUL 分隔、不加引号、不转义）；
 - 新增 `normGitPath()`（去引号 + 分隔符统一为 `/`），前缀比较与 `relFrom` 都在归一化路径上做；顺带删掉循环里未使用的 `remoteHave` 探测。
 
-**验证**：进程内 harness 用**真实 git 输出**驱动 `runPull`（stub 掉子进程）：live 的 `SKILL.md` 为「本地乱改」时 `applied=1`，内容被覆盖为远端版本；测试侧修复后 Windows 正常终端 `npm test` 应为 78 项全绿（0.4.5 时的 5 例失败全部是上游 `main` 既有的 Windows 环境问题，已逐条修掉）。
+**验证**：进程内 harness 用**真实 git 输出**驱动 `runPull`（stub 掉子进程）：live 的 `SKILL.md` 为「本地乱改」时 `applied=1`，内容被覆盖为远端版本；测试侧修复后真机（Windows 正常终端）复跑 `npm test`：先是 78 项 = 77 通过 + 1 失败（行尾 CRLF，见下条），`0230b10` 修复后复跑 **78 项 = 78 通过 + 0 失败**（81.2s）。0.4.5 时的 5 例失败全部是上游 `main` 既有的 Windows 环境问题，已逐条修掉。
 
 **行尾/字节一致性（同一条循环的第二个问题）**：覆盖循环原先用 `fs.copyFile` 直接从 shadow 工作树取文件，而 Git for Windows 安装默认 `core.autocrlf=true`，checkout 会把 LF 换成 CRLF —— 于是同一个 `runPull` 里两条路径写出的字节不一致：常规路径用 `gitShowBuf('FETCH_HEAD:path')` 写仓库字节（LF），镜像路径写工作树字节（CRLF）。用户实机 `test/multi-instance.test.mjs:169` 报的就是这个：`actual 'from r1 v1\r\n'` / `expected 'from r1 v1\n'`（内容确实被冲回远端版本，只是行尾不对）。
 
